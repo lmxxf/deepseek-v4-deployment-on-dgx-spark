@@ -202,6 +202,94 @@
 
 ---
 
+## 日常运维命令速查
+
+### 启动推理服务
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+./launch-cluster.sh -t vllm-node-sm120 exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 1000000 \
+  --enforce-eager
+```
+
+### 停止推理服务
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+./launch-cluster.sh -t vllm-node-sm120 stop
+```
+
+**不要 ctrl-c**——只杀 host 进程，slave 容器还在跑。必须用 stop。
+
+### 启动聊天网页（Open WebUI）
+
+```bash
+docker start open-webui
+```
+
+浏览器打开 http://192.168.31.198:3000 ，首次启动需要注册本地账号（不联网），注册后是管理员。
+
+如果是第一次安装 Open WebUI：
+
+```bash
+docker run -d --name open-webui \
+  -p 3000:8080 \
+  -e OPENAI_API_BASE_URL=http://192.168.31.198:8000/v1 \
+  -e OPENAI_API_KEY=none \
+  --restart unless-stopped \
+  ghcr.io/open-webui/open-webui:main
+```
+
+ARM64 上首次启动初始化数据库要好几分钟，耐心等。
+
+### 测试 API
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/.cache/huggingface/deepseek-v4-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "max_tokens": 100
+  }'
+```
+
+### 关键路径
+
+| 路径 | 内容 |
+|------|------|
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/` | 模型权重（158GB，两台都有） |
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker/` | eugr 构建工具 + 改过的 Dockerfile |
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/vllm-sm120/` | jasl vllm ds4-sm120 源码 |
+
+### 网络地址
+
+| 节点 | WiFi IP | CX7 IP |
+|------|---------|--------|
+| host (spark-3a10) | 192.168.31.198 | 169.254.248.35 |
+| slave (spark-e8bb) | 192.168.31.172 | 169.254.30.81 |
+
+### 已开源
+
+- Docker Hub：`docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest`
+- GitHub：`https://github.com/lmxxf/deepseek-v4-deployment-on-dgx-spark`
+
+### 显存分配
+
+- 总可用：~206GB（两台各 103GB，0.85 利用率）
+- 模型权重：~148GB（每台 73.85GB）
+- KV cache：~58GB，V4 的 KV cache 仅传统模型 2%，1M 上下文只需约 5GB，绰绰有余
+
+---
+
 ## 经验总结
 
 1. **DGX Spark 双机 ≠ 一台大机器**——是分布式集群，所有分布式的坑一个不少
