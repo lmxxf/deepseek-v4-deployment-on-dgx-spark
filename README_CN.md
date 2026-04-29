@@ -104,6 +104,25 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"max_tokens":100}'
 ```
 
+## 显存分配（双机 256GB）
+
+| 项目 | 单机 | 双机合计 |
+|------|------|----------|
+| 统一内存 | 128 GB | 256 GB |
+| 可用 GPU 显存 (~121 GB) × 0.85 | ~103 GB | ~206 GB |
+| 模型权重（TP=2，每台存一半） | 73.85 GB | ~148 GB |
+| **剩余给 KV Cache** | **~29 GB** | **~58 GB** |
+
+DeepSeek V4 Flash 采用 CSA + HCA 混合注意力架构，KV cache 极小——仅为传统 GQA 模型的 **~2%**。1M 上下文 fp8 KV cache 只需约 5GB。所以 58GB 的 KV cache 空间**完全支持 1M token 上下文**。
+
+推荐 `--max-model-len` 设置：
+
+| 设置 | 场景 |
+|------|------|
+| `8192` | 快速测试 |
+| `65536` | 日常多轮对话 |
+| `1000000` | 完整 1M 上下文（支持，KV cache 仅需约 5GB） |
+
 ## 架构说明
 
 ```

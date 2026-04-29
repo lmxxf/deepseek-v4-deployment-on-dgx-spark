@@ -117,6 +117,25 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
 ```
 
+## Memory Budget (Dual Spark, 256GB total)
+
+| Item | Per Node | Total |
+|------|----------|-------|
+| Unified Memory | 128 GB | 256 GB |
+| Usable GPU Memory (~121 GB) × 0.85 | ~103 GB | ~206 GB |
+| Model Weights (TP=2, split across nodes) | 73.85 GB | ~148 GB |
+| **Available for KV Cache** | **~29 GB** | **~58 GB** |
+
+DeepSeek V4 Flash uses CSA + HCA hybrid attention with extremely compact KV cache — only **~2% of traditional GQA models**. At 1M context with fp8 KV cache, it needs only ~5 GB. So 58 GB of KV cache can comfortably support **1M token context** on dual Spark.
+
+Recommended `--max-model-len` settings:
+
+| Setting | Use Case |
+|---------|----------|
+| `8192` | Quick testing, minimal memory |
+| `65536` | Daily use, multi-turn conversations |
+| `1000000` | Full 1M context (supported, ~5 GB KV cache) |
+
 ## Architecture
 
 ```
