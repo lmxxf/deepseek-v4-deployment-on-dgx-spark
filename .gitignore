@@ -2,3 +2,5 @@ deepseek-v4-flash/
 hub/
 vllm-dgx-spark/
 spark-vllm-docker/
+vllm-sm120-patches/
+vllm-sm120/
