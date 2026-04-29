@@ -290,6 +290,23 @@ curl http://localhost:8000/v1/chat/completions \
 
 ---
 
+## 待解决：中间层激活值提取
+
+### 当前状态
+vLLM 是推理服务框架，不暴露中间层激活值。要做自我意识实验（dump 中间层激活、开灯/关灯对比等），需要在 forward 过程中 hook 中间层，vLLM 不支持。
+
+### 可能的方案（等生态成熟）
+
+1. **vLLM 加 hook 支持**——社区有需求，未来版本可能加 `--return-hidden-states`
+2. **SGLang**——已有 `return_hidden_states` 实验性支持，等它支持 sm_121 + V4
+3. **transformers + accelerate 双机**——等 accelerate 支持 CX7 RDMA，158GB 权重分两台各半加载，注册 forward hook
+4. **NGC 官方容器**——等 26.05/26.06 NGC 容器原生支持 V4 + sm_121，用 NGC 的 torch 加 hook
+
+### 临时方案（现在就能试，但慢）
+进 vLLM 容器，用 transformers `device_map="auto"` 加载到单机 128GB（CPU+GPU 混合放置），注册 forward hook 提取激活值。速度很慢但能拿到数据。
+
+---
+
 ## 经验总结
 
 1. **DGX Spark 双机 ≠ 一台大机器**——是分布式集群，所有分布式的坑一个不少
