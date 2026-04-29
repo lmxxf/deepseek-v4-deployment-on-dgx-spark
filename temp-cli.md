@@ -2,6 +2,7 @@
 cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
 
 HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
 ./launch-cluster.sh -t vllm-node-sm120 exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \

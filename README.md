@@ -91,7 +91,7 @@ HF_HOME=/path/to/weights/parent \
   --distributed-executor-backend ray \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
-  --max-model-len 8192 \
+  --max-model-len 1000000 \
   --enforce-eager
 ```
 
@@ -105,7 +105,7 @@ HF_HOME=/path/to/weights/parent \
   --distributed-executor-backend ray \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
-  --max-model-len 8192 \
+  --max-model-len 1000000 \
   --enforce-eager
 ```
 
