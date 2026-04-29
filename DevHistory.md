@@ -135,12 +135,54 @@
 
 ## 第五阶段：换方案
 
-### eugr/spark-vllm-docker（当前进行中）
+### eugr/spark-vllm-docker（构建成功，运行失败）
 - 社区专门给 DGX Spark 做的 Docker 构建方案
-- 从源码编译 vLLM，针对 ARM64 + Blackwell sm_121 优化
+- 从源码编译 vLLM 0.20.1rc1，针对 ARM64 + Blackwell sm_121 优化
 - 有 Transformers v5 版本（`vllm-node-tf5`），支持 DeepSeek V4
-- `./build-and-copy.sh -t vllm-node-tf5 -c` 自动构建 + 复制到 slave
-- 构建中...
+- `./build-and-copy.sh -t vllm-node-tf5 -c` 构建成功，17 分钟，自动复制到 slave
+- Dockerfile 修改：nccl 和 DeepGEMM 都改成宿主机预先 clone + COPY（Docker 内访问不了 GitHub）
+
+### 坑13：DeepGEMM 缺失
+- vLLM 的 Sparse Attention Indexer 需要 DeepGEMM 库
+- eugr 镜像默认不含 DeepGEMM
+- **解法**：在 Dockerfile 里加 `COPY deepgemm-src/ + pip install`
+- 注意 git submodule（cutlass）也要一起 clone
+
+### 坑14：torch inductor `auto_functionalized` 错误（再次）
+- DeepGEMM 安装成功后，`--enforce-eager` 模式绕过 torch.compile
+- 但仍然在 dummy_run 阶段触发 inductor 编译路径
+
+### 坑15：DeepGEMM hyperconnection 不支持 sm_121（致命）
+- `RuntimeError: Assertion error (csrc/apis/hyperconnection.hpp:56): Unsupported architecture`
+- DeepGEMM 的 `tf32_hc_prenorm_gemm` kernel 硬编码了架构检查
+- 只支持数据中心级 Blackwell (sm_100) 和 Hopper (sm_90)
+- DGX Spark 的 GB10 是 sm_121（桌面级 Blackwell），不在支持列表
+- 环境变量（`VLLM_USE_DEEP_GEMM=0` 等）无法绕过——hyperconnection 是独立的代码路径
+- 论坛上有人用 Triton kernel 补丁成功，但补丁和 eugr 镜像的 vLLM 版本不兼容
+
+### 坑16：jasl/vllm fork 补丁版本不匹配
+- jasl 的 `ds4-sm120` 分支专门做了 sm_120 系列支持
+- 尝试用 `-v` 挂载替换个别 .py 文件到 eugr 容器
+- 失败：`ImportError: cannot import name 'dequantize_combined_sparse_mla_decode_kv'`
+- 两个版本的 vllm 内部 API 不兼容，部分替换行不通
+
+### 当前状态（2026-04-29）
+- **核心瓶颈**：DeepGEMM 不支持 sm_121，vLLM 的 DeepSeek V4 代码路径强依赖 DeepGEMM
+- **下一步方案**：
+  1. 用 jasl/vllm ds4-sm120 分支从源码构建完整 Docker 镜像（最靠谱但耗时）
+  2. 等 eugr/spark-vllm-docker 更新支持 DeepSeek V4
+  3. 等 vLLM 官方合并 PR #40991（sm120 Triton fallback）
+
+---
+
+## 第六阶段：Docker 构建中的代理坑
+
+### Docker 代理配置
+- Docker build 容器内通过 `~/.docker/config.json` 配代理
+- `127.0.0.1` 在容器内不可达，必须用宿主机 IP（`192.168.31.198`）
+- `noProxy` 要排除不需要翻墙的域名：`*.ubuntu.com`、`*.nvidia.com`、`*.nvidia.cn`、`*.pypi.org`、`*.pythonhosted.org`、`*.pytorch.org`、`download-r2.pytorch.org`
+- 最终方案：**去掉 Docker 代理**，GitHub 相关的在宿主机预先 clone 好 COPY 进去
+- ShellCrash 的 Redir 模式（iptables 透明代理）让宿主机不需要设 proxy 环境变量就能访问 GitHub，但 Docker build 的网络是隔离的不走 iptables
 
 ---
 
@@ -152,3 +194,6 @@
 4. **Mac 的优势是零配置**——统一内存 + MLX/llama.cpp，一条命令跑模型；代价是没有 Blackwell FP4 加速
 5. **200Gbps CX7 够用但不是 NVLink**——跨机 TP 每层通信延迟是微秒级（NVLink 是纳秒级），MoE 模型通信量小所以影响可控
 6. **rsync 走 CX7 很快**——581MB/s，160G 五分钟，比 WiFi 快几十倍
+7. **sm_121 是孤儿架构**——DGX Spark 的 GB10 (sm_121) 既不是数据中心 Blackwell (sm_100) 也不是桌面 RTX (sm_120)，DeepGEMM/vLLM 的 CUDA kernel 两边都没覆盖到，需要 Triton fallback
+8. **Docker build 里的代理是大坑**——容器网络隔离，宿主机的透明代理不生效；GitHub 需要翻墙但 apt/pip/PyTorch 不需要，`noProxy` 配置是场噩梦；最终方案：不用代理，GitHub 相关的在宿主机 clone 好 COPY 进去
+9. **"256GB 共享内存"是营销话术**——实际是两台独立机器通过 RDMA 网络组成的分布式集群，模型权重两边各存一份，GPU 通信走 NCCL + CX7
