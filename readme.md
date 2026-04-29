@@ -9,7 +9,17 @@
 - **host (spark-3a10)**：192.168.31.198 / CX7: 169.254.248.35
 - **slave (spark-e8bb)**：192.168.31.172 / CX7: 169.254.30.81
 
-## 快速开始
+## 预构建镜像
+
+不想自己编译的话，直接拉取预构建镜像（ARM64/aarch64 only）：
+
+```bash
+docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
+```
+
+然后跳到第 4 步启动推理服务，把 `-t vllm-node-sm120` 改成 `-t lmxxf/vllm-deepseek-v4-dgx-spark`。
+
+## 从零开始
 
 ### 1. 双机组网
 
