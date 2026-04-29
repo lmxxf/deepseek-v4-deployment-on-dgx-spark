@@ -96,7 +96,15 @@ HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
   --enforce-eager
 ```
 
-### 5. 测试
+### 5. 停止
+
+```bash
+./launch-cluster.sh -t vllm-node-sm120 stop
+```
+
+重启前必须先 stop——否则 slave 上的容器还在跑。不要直接 ctrl-c。
+
+### 6. 测试
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \

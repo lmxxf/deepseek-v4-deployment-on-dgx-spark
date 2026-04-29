@@ -109,7 +109,15 @@ HF_HOME=/path/to/weights/parent \
   --enforce-eager
 ```
 
-### 5. Test
+### 5. Stop
+
+```bash
+./launch-cluster.sh -t vllm-node-sm120 stop
+```
+
+Must run `stop` before restarting — otherwise the worker node's container keeps running.
+
+### 6. Test
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
