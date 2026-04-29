@@ -166,12 +166,28 @@
 - 失败：`ImportError: cannot import name 'dequantize_combined_sparse_mla_decode_kv'`
 - 两个版本的 vllm 内部 API 不兼容，部分替换行不通
 
-### 当前状态（2026-04-29）
-- **核心瓶颈**：DeepGEMM 不支持 sm_121，vLLM 的 DeepSeek V4 代码路径强依赖 DeepGEMM
-- **下一步方案**：
-  1. 用 jasl/vllm ds4-sm120 分支从源码构建完整 Docker 镜像（最靠谱但耗时）
-  2. 等 eugr/spark-vllm-docker 更新支持 DeepSeek V4
-  3. 等 vLLM 官方合并 PR #40991（sm120 Triton fallback）
+### 坑17：jasl fork 从源码编译的坑
+- 改 eugr Dockerfile 把预编译 whl 换成 jasl 源码编译
+- Docker 不跟软链——`ln -s` 不行，必须 `cp -r`
+- 缺 `setuptools_scm`、`pybind11`、`cmake`——逐个加
+- `setuptools` 版本冲突——torch 要 `<82`，vllm 要 `<81`，新 pyproject.toml 要 `>=75`
+- requirements.txt 里的 hash 锁定——直接 `sed` 删掉所有 `--hash` 行
+- 每次编译约 1 小时，共编译 4 次
+
+### 坑18：CUDA 架构不匹配（最后一个坑）
+- 编译成功，hyperconnection Triton fallback 生效——不再报 `Unsupported architecture`
+- 但运行时 `CUDA error: no kernel image is available for execution on the device`
+- 根因：容器里的 torch 2.11.0（PyPI 社区版）只支持到 sm_120，不包含 sm_121
+- DGX Spark GPU 实际是 sm_121 (Capability 12.1)
+- **解法**：vLLM C++ 扩展编译时用 `TORCH_CUDA_ARCH_LIST="12.0"` + `CMAKE_CUDA_ARCHITECTURES="120-real"`
+- sm_120 的 kernel 在 sm_121 上前向兼容——sm_121 是 sm_120 的超集
+- 重新编译一次，43 分钟，**跑通了**
+
+### ✅ 最终成功（2026-04-29）
+- 首次请求返回：*"你好，我是DeepSeek，一个由深度求索公司打造的AI助手，乐于为你解答问题、提供信息与创意灵感。"*
+- 从 4-28 晚开始到 4-29 下午出字，约 48 小时
+- 核心方案：eugr 基础设施 + jasl sm_120 fork 源码编译 + sm_120 前向兼容
+- 镜像名：`vllm-node-sm120`
 
 ---
 
@@ -197,3 +213,5 @@
 7. **sm_121 是孤儿架构**——DGX Spark 的 GB10 (sm_121) 既不是数据中心 Blackwell (sm_100) 也不是桌面 RTX (sm_120)，DeepGEMM/vLLM 的 CUDA kernel 两边都没覆盖到，需要 Triton fallback
 8. **Docker build 里的代理是大坑**——容器网络隔离，宿主机的透明代理不生效；GitHub 需要翻墙但 apt/pip/PyTorch 不需要，`noProxy` 配置是场噩梦；最终方案：不用代理，GitHub 相关的在宿主机 clone 好 COPY 进去
 9. **"256GB 共享内存"是营销话术**——实际是两台独立机器通过 RDMA 网络组成的分布式集群，模型权重两边各存一份，GPU 通信走 NCCL + CX7
+10. **sm_120 前向兼容 sm_121**——torch 社区版只编译到 sm_120，但 sm_121 能跑 sm_120 的 kernel。编译时指定 `TORCH_CUDA_ARCH_LIST="12.0"` 就行
+11. **Docker 里编译 vLLM 需要约 1 小时**——ARM64 Grace CPU 10 核，MAX_JOBS=16。每次改一行重新编译都是一小时。一定要一次改对

@@ -1,45 +1,34 @@
-# DeepSeek V4 Flash 双机部署指南
+# DeepSeek V4 Flash on Dual DGX Spark
 
-两台 DGX Spark 通过 ConnectX-7 + QSFP56 线缆组 256GB 共享显存，跑 DeepSeek V4 Flash (280B)。
+两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 运行 DeepSeek V4 Flash (280B, 158GB FP4)。
 
 ## 硬件
 
-- DGX Spark ×2，各 128GB GPU 显存
-- QSFP56 DAC 线缆（200Gbps RDMA）
-- 模型权重：`deepseek-ai/DeepSeek-V4-Flash`，~160GB FP4
+- DGX Spark ×2，各 128GB 统一内存，GPU: NVIDIA GB10 (sm_121)
+- QSFP56 DAC 线缆，ConnectX-7 200Gbps RDMA 直连
 - **host (spark-3a10)**：192.168.31.198 / CX7: 169.254.248.35
 - **slave (spark-e8bb)**：192.168.31.172 / CX7: 169.254.30.81
 
-## 第一步：网络配置（两台都执行）✅
+## 快速开始
+
+### 1. 双机组网
+
+两台都执行：
 
 ```bash
 sudo wget -O /etc/netplan/40-cx7.yaml \
   https://github.com/NVIDIA/dgx-spark-playbooks/raw/main/nvidia/connect-two-sparks/assets/cx7-netplan.yaml
-
 sudo chmod 600 /etc/netplan/40-cx7.yaml
 sudo netplan apply
-```
 
-## 第二步：自动发现 + SSH 免密（两台都执行）✅
-
-```bash
 wget https://github.com/NVIDIA/dgx-spark-playbooks/raw/refs/heads/main/nvidia/connect-two-sparks/assets/discover-sparks
-
 chmod +x discover-sparks
 ./discover-sparks
 ```
 
-## 第三步：验证连通 ✅
+### 2. 下载模型权重（两台都需要）
 
-```bash
-# 在 host 上
-ping -c 3 192.168.31.172
-
-# 在 slave 上
-ping -c 3 192.168.31.198
-```
-
-## 第四步：下载权重 ✅
+host 上下载：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
@@ -47,65 +36,92 @@ huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
   --local-dir /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash
 ```
 
-## 第五步：部署 vLLM 双机推理
-
-使用 Docker 容器方案，NCCL/Ray/vLLM 全部打包在 NGC 容器里，不需要手动编译。
-
-参考：https://github.com/mark-ramsey-ri/vllm-dgx-spark
-
-### 5.1 克隆部署工具（在 host 上）
+rsync 到 slave（走 CX7，581MB/s）：
 
 ```bash
-cd /home/lmxxf/work/deepseek-v4-flash-deployment
-git clone https://github.com/mark-ramsey-ri/vllm-dgx-spark.git
-cd vllm-dgx-spark
+rsync -avP /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/ \
+  lmxxf@<slave_CX7_IP>:/home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/
 ```
 
-### 5.2 查 CX7 InfiniBand IP（在 slave 上）
+### 3. 构建 Docker 镜像
+
+核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork（sm_120 Triton fallback）。
 
 ```bash
-ip addr show enp1s0f1np1 | grep "inet "
+# 克隆构建工具
+git clone https://github.com/eugr/spark-vllm-docker.git
+cd spark-vllm-docker
+
+# 克隆依赖源码（Docker 内无法访问 GitHub）
+git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git nccl-src
+git clone --depth 1 -b ds4-sm120 https://github.com/jasl/vllm.git vllm-sm120
+
+# 删除 vllm requirements 里的 hash 锁定
+find vllm-sm120/ -name "*.txt" -path "*/require*" -exec sed -i '/--hash/d; s/ \\$//' {} +
 ```
 
-记下 169.254.x.x 地址。
-
-### 5.3 配置（在 host 上）
+修改 Dockerfile（关键改动）：
+- NCCL：`COPY nccl-src/` 替代 `git clone`
+- vLLM：用 jasl 源码编译替代预编译 whl，`TORCH_CUDA_ARCH_LIST="12.0"` + `CMAKE_CUDA_ARCHITECTURES="120-real"`
+- 额外依赖：`cmake`、`setuptools_scm`、`setuptools>=75,<81`、`pybind11`
 
 ```bash
-cp config.env config.local.env
+# 构建并自动复制到 slave（约 1 小时）
+./build-and-copy.sh -t vllm-node-sm120 -c
 ```
 
-编辑 `config.local.env`：
-
-```
-WORKER_HOST="192.168.31.172"
-WORKER_IB_IP="169.254.30.81"
-WORKER_USER="lmxxf"
-TENSOR_PARALLEL="2"
-MODEL="deepseek-ai/DeepSeek-V4-Flash"
-```
-
-### 5.4 启动集群
+### 4. 启动推理服务
 
 ```bash
-./start_cluster.sh
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+./launch-cluster.sh -t vllm-node-sm120 exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 8192 \
+  --enforce-eager
 ```
 
-自动拉取 NGC vLLM 容器、启动 Ray 集群、加载模型。
-
-### 5.5 验证
+### 5. 测试
 
 ```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/v1/models
-
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"你好"}],"max_tokens":50}'
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"max_tokens":100}'
 ```
 
-### 5.6 停止
+## 架构说明
 
-```bash
-./stop_cluster.sh
 ```
+用户 → host:8000 (vLLM API)
+              ↓
+        Ray 调度器 (host)
+        ↙          ↘
+  GPU 0 (host)   GPU 1 (slave)
+  73.85 GiB      73.85 GiB
+        ↘          ↙
+     NCCL AllReduce (CX7 200Gbps)
+              ↓
+        输出 token
+```
+
+- **Ray**：调度员，管进程启停和资源分配
+- **NCCL**：通信层，GPU 间张量传输
+- **Tensor Parallel**：每层矩阵乘法水平切分，两台同时算，每层 AllReduce 同步
+- MoE 模型只激活 13B/280B 参数，跨机通信量相对较小
+
+## 关键技术点
+
+| 问题 | 解法 |
+|------|------|
+| DeepSeek V4 太新，NGC 26.03 不支持 | jasl/vllm ds4-sm120 fork，Triton fallback |
+| DeepGEMM 不支持 sm_121 | jasl fork 用 TileLang 重写 hyperconnection kernel |
+| torch 社区版只到 sm_120 | 编译时 `TORCH_CUDA_ARCH_LIST="12.0"`，sm_120 前向兼容 sm_121 |
+| Docker 内无法访问 GitHub | 宿主机预先 clone，COPY 进容器 |
+| vLLM requirements hash 锁定 | `sed` 删除所有 `--hash` 行 |
+
+## 踩坑详情
+
+见 [DevHistory.md](DevHistory.md)——48 小时，18 个坑的完整记录。
