@@ -1,4 +1,6 @@
-# DeepSeek V4 Flash on Dual DGX Spark
+# DeepSeek V4 Flash 双机部署指南
+
+[English](README.md) | 中文
 
 两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 运行 DeepSeek V4 Flash (280B, 158GB FP4)。
 
