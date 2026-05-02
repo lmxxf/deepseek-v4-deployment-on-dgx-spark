@@ -307,6 +307,85 @@ vLLM 是推理服务框架，不暴露中间层激活值。要做自我意识实
 
 ---
 
+## 第七阶段：长输出垃圾问题排查（2026-05-02，未解决）
+
+### 现象
+短回复（<100 token）正常，长输出（>100 token）开头固定出垃圾（重复符号、多语言乱码），几十 token 后模型自己拉回来输出正常内容。
+
+### 排查过程
+
+1. **chat template 排查**：tokenizer_config.json 没有 chat_template 字段（V4 设计如此，用 `--tokenizer-mode deepseek_v4` 代替）
+2. **发现 `</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误在 prompt 末尾插入 `</think>`。已修复（`docker commit` 保存）
+3. **修复后仍然出垃圾**：prompt_tokens 从 14 降到 13（修复生效），但输出模式不变
+4. **tokenizer 验证**：`PreTrainedTokenizerFast` 直接编码特殊 token 完全正确（`<｜User｜>` → 128803 单 token）
+5. **completions 端点验证**：手动拼正确格式的 prompt 走 `/v1/completions`，也出垃圾——排除 chat template 问题
+6. **Docker Hub 原版镜像验证**：`lmxxf/vllm-deepseek-v4-dgx-spark` 同样出垃圾——bug 一直存在，前天短对话没暴露
+7. **权重文件验证**：46 shard、149GB，config 正常
+8. **两台镜像一致性验证**：image ID 完全相同
+
+### 根因确认 ✅
+
+**Marlin MXFP4 MoE kernel 在 SM120/SM121 上产生错误计算结果。** 这是已知问题（vllm#40928、cutlass#3096）。
+
+日志：`Using 'MARLIN' Mxfp4 MoE backend` — Marlin 的 NVFP4 kernel 没有原生 SM120 支持，PTX fallback 从 sm_80 JIT 提升到 sm_121，cubin 产生**静默错误**。
+
+### 排除过程
+
+| 尝试 | 结果 |
+|------|------|
+| `--kv-cache-dtype` 去掉 | ❌ V4 强制要求 fp8 KV cache |
+| `--max-model-len 8192` | 无改善 |
+| `--moe-backend triton` | ❌ Triton MoE 不支持 SM120 |
+| `--moe-backend emulation` | ❌ emulation 不支持 MXFP4 权重转换 |
+| `--moe-backend cutlass` | ❌ cutlass 不在 MXFP4 可选列表 |
+| `--moe-backend flashinfer_cutlass` | ❌ 不支持 SM120 量化格式 |
+| 清页缓存 + 降 gpu-memory-utilization | 无改善 |
+| 两台重启 | 无改善 |
+
+**结论：SM120 上只有 Marlin 能跑 FP4 MoE，但 Marlin 在 SM120 上算错。其他所有 backend 都不支持 SM120。**
+
+### 为什么前天看起来"正常"
+
+前天只测了短对话（"你好"，<100 token）。短回复时 MoE 专家激活少、误差小，输出碰巧能自洽。长输出（>100 token）误差累积就跑飞。
+
+### 速度基线（参考，输出含垃圾）
+- 短回复：33 tokens / 3.8s = ~8.7 tok/s（含 prefill）
+- 长输出（重复 token）：1000 tokens / 75.3s = ~13.3 tok/s
+- 长输出（混合垃圾+正常）：500 tokens / 54s = ~9.3 tok/s
+
+### 进一步排查：不是全坏，是部分坏（2026-05-02 晚）
+
+| Prompt | 结果 | tokens | finish |
+|--------|------|--------|--------|
+| "2+2" | ✅ 正确 "4" | 2 | stop |
+| "用200字介绍北京的历史" | ✅ 完美 | 135 | stop |
+| "1+1等于几" | ✅ 正确 | 33 | stop |
+| "写一个Python快速排序函数" | ❌ 垃圾 | 500 | length |
+| "唐朝著名诗人" | ❌ 垃圾 | 500 | length |
+| "What is quicksort" | ❌ 垃圾 | 500 | length |
+| "请用500字介绍万里长城" | ❌ 垃圾 | 600 | length |
+| "print hello world in python" | ❌ 垃圾 | 50 | length |
+| 加 system prompt | ❌ 垃圾 | 16 | length |
+
+**模式**：知识问答类 prompt 正常（模型自然生成 EOS 停止），代码类/长文类从第一个 token 开始跑飞（被 max_tokens 截断）。不同 prompt 激活不同的 MoE 专家组合，某些专家的 FP4 计算在 SM120 上是错的。
+
+**Marlin .so 确认编译了 sm_120 cubin**（不是 PTX fallback）——问题是 Marlin 的 FP4 mma.sync kernel 在 SM120 上计算结果错误，可能和 SM120 的 FP4 MMA 行为差异有关。
+
+**其他 MoE backend 排查**：
+- `--moe-backend triton`：不支持 SM120
+- `--moe-backend emulation`：权重转换不支持 / 反量化依赖 amd-quark / quant scheme 不匹配
+- `--moe-backend cutlass/flashinfer_cutlass`：不支持 MXFP4 或 SM120
+
+**另外修复了 `</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误插入 `</think>`。已在容器内修复。
+
+### 解法方向
+
+1. **Consumer-DeepGEMM**（本项目）：用 CUTLASS SM120 模板实现正确的 FP4 MoE kernel，替换 Marlin——CUTLASS Example 79 有现成的 SM120 FP4 Grouped GEMM
+2. 等 vLLM 上游修复 Marlin SM120 支持
+3. 等 NVIDIA NGC 容器原生支持 V4 + SM121
+
+---
+
 ## 经验总结
 
 1. **DGX Spark 双机 ≠ 一台大机器**——是分布式集群，所有分布式的坑一个不少
