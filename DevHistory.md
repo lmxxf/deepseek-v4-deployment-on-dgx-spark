@@ -457,6 +457,71 @@ docker run --rm \
 **当前状态：编译链路打通，但还没接真实 GEMM。**  
 现在 `_C` 里只有 CUTLASS SM120/SM121 探针，证明 CUDA 13.2 + PyTorch 2.11.0+cu130 + CUTLASS + aarch64 编译链路可用。真正的 `m_grouped_fp8_fp4_gemm_nt_contiguous` 还没从 CUTLASS Example 79d 拆出来。
 
+**2026-05-03 追加：grouped fallback 语义修正**
+
+- 修复 `Consumer-DeepGEMM/consumer_deep_gemm/gemm.py`：
+  - `m_grouped_fp8_fp4_gemm_nt_contiguous` 不再把真实 MoE grouped B 当普通 2D GEMM 处理
+  - 新增 per-row `m_indices` 分组路径，支持 `-1` padding 行清零
+  - grouped B 反量化后按 group 选择对应专家权重，逐组执行 `A_group @ B_group.T`
+  - 对 B 的 `[G, N, K]` / `[G, K, N]` 两种布局做最小推断
+- 新增测试：`tests/test_fp4_fallback.py::test_m_grouped_fp8_fp4_gemm_nt_contiguous_uses_grouped_b`
+- 本地验证：
+
+```bash
+python3 Consumer-DeepGEMM/tests/test_fp4_fallback.py
+```
+
+结果通过。当前环境没有 `pytest`，所以没有跑 `pytest -q`。
+
+这个修复不是性能解法，但它把 Python fallback 的 MoE 语义接正了。后续 CUTLASS 79d kernel 可以替换 `_m_grouped_fp8_fp4_fallback_nt` 的内部实现，不需要再改 vLLM-facing API。
+
+**2026-05-03 追加：Docker 可装载路径打通**
+
+- 新增顶层 `deep_gemm` compatibility package：
+  - `import deep_gemm` 会转发到 `consumer_deep_gemm`
+  - 补了最小 `deep_gemm.utils.math`，避免 vLLM/测试 import 直接炸
+- 新增 `consumer_deep_gemm/mega.py`：
+  - 实现纯张量的 `transform_weights_for_mega_moe`
+  - `get_symm_buffer_for_mega_moe` / `fp8_fp4_mega_moe` 先明确 `NotImplementedError`
+  - 这不是最终 MegaMoE 解法，只是让 import 链和权重 transform 链先落地
+- 修复 FP4 fallback 支持 vLLM 实际传入的 `int8` packed FP4 view
+- 修复 `get_mk_alignment_for_contiguous_layout()` 返回类型：Consumer 包内部返回 int，vLLM wrapper 再包装成 `[align, align]`
+- 新增 Docker 内安装脚本：
+
+```bash
+cd /work/Consumer-DeepGEMM
+./scripts/install_in_vllm_container.sh
+```
+
+脚本动作：
+
+1. `pip install -e .`
+2. 构建 `consumer_deep_gemm._C`
+3. 写入 `vllm.third_party.deep_gemm` shim
+4. patch vLLM 的 DeepGEMM 支持检查，让 SM120/SM121 通过（原来只认 SM90/SM100）
+5. 打印 `deep_gemm` 和 `vllm.third_party.deep_gemm` 的 native probe
+
+已验证：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/install_in_vllm_container.sh'
+```
+
+输出确认：
+
+```text
+deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+vllm.third_party.deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+```
+
+中途踩到 Docker bind mount owner 不一致导致 `git safe.directory` 报错，已在 installer 里自动处理。
+
+**当前边界**：现在已经能“放进 vLLM Docker 里安装、import、通过 SM121 support gate、构建 native 扩展探针”。还不能证明长输出垃圾消失，因为真实 CUTLASS 79d grouped FP4 GEMM kernel 仍未接入，native `_C` 仍只有 probe。
+
 下一步：
 
 1. 从 CUTLASS `79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 拆出库函数
