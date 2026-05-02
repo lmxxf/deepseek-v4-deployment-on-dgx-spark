@@ -378,11 +378,31 @@ vLLM 是推理服务框架，不暴露中间层激活值。要做自我意识实
 
 **另外修复了 `</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误插入 `</think>`。已在容器内修复。
 
+### vLLM 框架内修复尝试（全部失败）
+
+| 方案 | 结果 |
+|------|------|
+| `--moe-backend triton` | Triton MoE 不支持 SM120 设备 |
+| `--moe-backend emulation` (OCP) | 需要 amd-quark，quark 依赖 `torch.ao.quantization.pt2e`，容器 PyTorch 没有 |
+| `--moe-backend emulation` (Nvfp4) | `global_scale` 为 None，初始化路径不匹配 |
+| `--moe-backend cutlass` | 不在 MXFP4 可选列表 |
+| `--moe-backend flashinfer_cutlass` | 不支持 SM120 量化格式 |
+| 绕过 `_return_or_raise` 检查 | ✅ 生效但后续反量化函数缺依赖 |
+| 绕过 `convert_weight_to_mxfp4_moe_kernel_format` | ✅ 生效但后续 forward 缺依赖 |
+
+**结论：vLLM 框架内的所有 fallback 路径在 SM120 + 当前容器环境下都不可用。Marlin 是唯一能跑的 backend，但计算结果部分错误。**
+
+### 附加修复
+
+- **`</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误插入 `</think>`。已修复（`docker commit`）
+- **`autodiscover` 超时**：`169.254.0.0/16` 网段 65534 个 IP 扫描超时，加 `-n` 参数手动指定节点解决
+
 ### 解法方向
 
-1. **Consumer-DeepGEMM**（本项目）：用 CUTLASS SM120 模板实现正确的 FP4 MoE kernel，替换 Marlin——CUTLASS Example 79 有现成的 SM120 FP4 Grouped GEMM
-2. 等 vLLM 上游修复 Marlin SM120 支持
-3. 等 NVIDIA NGC 容器原生支持 V4 + SM121
+1. **Consumer-DeepGEMM**（新项目）：用 CUTLASS SM120 模板实现正确的 FP4 MoE kernel，替换 Marlin——CUTLASS Example 79 有现成的 SM120 FP4 Grouped GEMM
+2. **替换 `dequant_mxfp4` 函数**：用实验平台验证过的 FP4 查表法重写反量化，不依赖 quark
+3. 等 vLLM 上游修复 Marlin SM120 支持
+4. 等 NVIDIA NGC 容器原生支持 V4 + SM121
 
 ---
 
