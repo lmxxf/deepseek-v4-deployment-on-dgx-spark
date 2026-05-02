@@ -1,0 +1,3 @@
+[submodule "Consumer-DeepGEMM"]
+	path = Consumer-DeepGEMM
+	url = git@github.com:lmxxf/Consumer-DeepGEMM.git
