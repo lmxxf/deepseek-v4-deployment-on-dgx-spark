@@ -522,6 +522,36 @@ vllm.third_party.deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'ar
 
 **当前边界**：现在已经能“放进 vLLM Docker 里安装、import、通过 SM121 support gate、构建 native 扩展探针”。还不能证明长输出垃圾消失，因为真实 CUTLASS 79d grouped FP4 GEMM kernel 仍未接入，native `_C` 仍只有 probe。
 
+**2026-05-03 追加：native ABI 钉死，准备合入 Docker 测试**
+
+- `_C` 新增 `m_grouped_fp8_fp4_gemm_nt_contiguous` 入口：
+  - 接收 DeepGEMM/vLLM 形态：`(a, a_scale), (b, b_scale), d, m_indices, **kwargs`
+  - C++ 侧检查 CUDA、contiguous、dtype、shape、`m_indices` 长度
+  - 当前检查通过后返回 `None`，让 Python fallback 继续负责正确性计算
+  - 这个设计是刻意的：ABI 先稳定，后面接 CUTLASS 79d 时只替换函数内部 launch，不再改 Python/vLLM-facing 接口
+- 修复 native wrapper：只有 CUDA tensor 才进 `_C`，CPU 测试仍走 fallback
+- 新增 `tests/test_native_abi.py`：
+  - CUDA 可用且 native extension 可用时，验证 `_C` ABI 可调用
+  - 验证 native 返回 `None` 后 Python fallback 输出 `[[5], [8], [0], [5]]`
+- 已验证：
+
+```bash
+python3 Consumer-DeepGEMM/tests/test_fp4_fallback.py
+python3 Consumer-DeepGEMM/tests/test_native_abi.py
+```
+
+带 GPU Docker 验证：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh >/tmp/build.log && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_native_abi.py'
+```
+
+结果通过。下一步可以把当前 Consumer-DeepGEMM 合入 vLLM Docker 做安装链路测试；真实长输出修复仍依赖 CUTLASS 79d kernel 接入。
+
 下一步：
 
 1. 从 CUTLASS `79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 拆出库函数
