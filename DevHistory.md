@@ -404,6 +404,66 @@ vLLM 是推理服务框架，不暴露中间层激活值。要做自我意识实
 3. 等 vLLM 上游修复 Marlin SM120 支持
 4. 等 NVIDIA NGC 容器原生支持 V4 + SM121
 
+### Consumer-DeepGEMM 进展（2026-05-03）
+
+**主线确定：不再继续在 vLLM 里硬 patch Marlin/emulation，老老实实做 Consumer-DeepGEMM。**
+
+已完成：
+
+1. **Python fallback 正确性修正**
+   - `fp8_fp4_*` 不再把 packed FP4 权重当 FP8 解码
+   - 新增 E2M1 查表解包 + E8M0 block scale 反量化
+   - 这是正确性兜底路径，不追求速度
+
+2. **CUTLASS native extension 骨架**
+   - 新增 `consumer_deep_gemm._C`
+   - 默认安装不编 CUDA，避免普通环境卡死
+   - 设置 `CONSUMER_DEEP_GEMM_BUILD_CUDA=1` 才编 CUDA extension
+   - `scripts/build_native_sm120.sh` 自动设置：
+     - `CUDA_HOME=/usr/local/cuda`
+     - `CUTLASS_PATH=../DeepGEMM/third-party/cutlass`
+     - `CONSUMER_DEEP_GEMM_CUDA_ARCH=120a`
+   - 兼容容器里只有 `python3` 没有 `python` 的情况
+
+3. **Docker 编译验证通过**
+   - base conda 的 PyTorch 是 CPU/非 CUDA 链接环境，不能编 extension：缺 `libc10_cuda` / `libtorch_cuda`
+   - 正确编译环境是 `vllm-node-sm120:latest`
+   - 用临时容器挂载源码编译成功：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh'
+```
+
+验证命令：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  python3 -c "import consumer_deep_gemm as dg; print(dg.native_build_info())"
+```
+
+输出：
+
+```text
+{'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+```
+
+**当前状态：编译链路打通，但还没接真实 GEMM。**  
+现在 `_C` 里只有 CUTLASS SM120/SM121 探针，证明 CUDA 13.2 + PyTorch 2.11.0+cu130 + CUTLASS + aarch64 编译链路可用。真正的 `m_grouped_fp8_fp4_gemm_nt_contiguous` 还没从 CUTLASS Example 79d 拆出来。
+
+下一步：
+
+1. 从 CUTLASS `79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 拆出库函数
+2. 先实现 `m_grouped_fp8_fp4_gemm_nt_contiguous`
+3. Python API 已经接好 native 优先、fallback 兜底
+4. 接上真实 kernel 后，再集成 vLLM 服务验证长输出垃圾是否消失
+
 ---
 
 ## 经验总结
