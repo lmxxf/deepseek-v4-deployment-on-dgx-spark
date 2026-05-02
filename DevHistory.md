@@ -679,3 +679,194 @@ True
 9. **"256GB 共享内存"是营销话术**——实际是两台独立机器通过 RDMA 网络组成的分布式集群，模型权重两边各存一份，GPU 通信走 NCCL + CX7
 10. **sm_120 前向兼容 sm_121**——torch 社区版只编译到 sm_120，但 sm_121 能跑 sm_120 的 kernel。编译时指定 `TORCH_CUDA_ARCH_LIST="12.0"` 就行
 11. **Docker 里编译 vLLM 需要约 1 小时**——ARM64 Grace CPU 10 核，MAX_JOBS=16。每次改一行重新编译都是一小时。一定要一次改对
+
+---
+
+## 2026-05-03 深夜：Consumer-DeepGEMM native grouped FP8×FP4 接入
+
+目标：解决 DeepSeek V4 Flash 长输出垃圾。根因仍是 Marlin MXFP4 MoE 在 SM120/SM121 上部分专家静默算错；这轮工作把 Consumer-DeepGEMM 从 probe 推进到真实 CUTLASS launch。
+
+已完成：
+
+1. **`m_grouped_fp8_fp4_gemm_nt_contiguous` 接入真实 native launch**
+   - Python API 仍保持 DeepGEMM 副作用语义：填充 `d`，返回 `None`
+   - C++ binding 在 native 成功时内部返回 `True`，Python 层吞掉这个返回值
+   - 不支持的形态继续退回 Python fallback
+
+2. **CUTLASS grouped launch 打通**
+   - 构造真实 device pointer arrays
+   - 构造 grouped problem sizes / strides / SFA/SFB layouts
+   - 分配 CUTLASS workspace
+   - 使用当前 CUDA stream 调 `initialize()` + `run()`
+   - 支持 vLLM 的 per-row `expert_ids`，包括 `-1` padding 行
+
+3. **DGX Spark 必须编 `sm_121a`**
+   - `sm_120a` 能编译、`can_implement()` 也能过，但真实 launch 会打印：
+     `Arch conditional MMA instruction used without targeting appropriate compute capability`
+   - 改默认 `CONSUMER_DEEP_GEMM_CUDA_ARCH=121a`
+
+4. **scale 语义修正**
+   - vLLM 传入的 activation / weight scales 常是 float32
+   - native 前统一转换成 E8M0 uint8
+   - activation SFA 从 `[M, K/128]` 扩成 CUTLASS SM120 MX layout 需要的 4 倍 scale atom
+   - `get_mk_alignment_for_contiguous_layout()` 默认改回 128，匹配 vLLM MoE scatter 的 `BLOCK_E=128`
+
+5. **数值 sanity 通过**
+   - 零输入 native launch 通过
+   - A=1、FP4 B=1、scale=1 的非零 reference case 输出全 128，说明基本计算路径正确
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/install_in_vllm_container.sh >/tmp/install.log && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_fp4_fallback.py && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_native_abi.py'
+```
+
+结果通过。
+
+已生成并同步双机镜像：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: 975ea7ef0cb7
+```
+
+host 和 slave 都已存在该镜像。镜像内包含：
+
+- `/opt/Consumer-DeepGEMM`
+- `/opt/DeepGEMM`
+- `consumer_deep_gemm._C` (`sm_121a`)
+- `vllm.third_party.deep_gemm` shim
+- vLLM SM120/SM121 DeepGEMM support gate patch
+
+验证输出：
+
+```text
+consumer {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+vllm {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+下一步：用 `vllm-node-sm121-cdg` 启动双机服务，跑长输出 prompt 验证乱码是否消失。
+
+### 追加：普通 FP8 linear 不再走 Consumer-DeepGEMM
+
+启动过程中连续修掉两层 ABI 后，服务进入 `determine_available_memory` 的 dummy run，但普通 FP8 linear 路径被 vLLM 的 DeepGEMM FP8 block kernel 接管，最终把 DeepGEMM 重排后的 weight scale layout 传给 Consumer 的 Python fallback：
+
+```text
+RuntimeError: The size of tensor a (1536) must match the size of tensor b (12) at non-singleton dimension 0
+```
+
+判断：这不是 MoE FP4 静默算错根因。Consumer-DeepGEMM 这轮只应该接管 DeepSeek V4 MoE FP4 grouped GEMM；普通 FP8 linear 原本已有 vLLM 非 DeepGEMM kernel 可用，不该继续在 Consumer fallback 里补 DeepGEMM FP8 scale layout。
+
+处理：
+
+- 保留 `platforms/cuda.py` 和 `deep_gemm_moe.py` 的 SM120/SM121 放行，让 fused MoE 能用 Consumer-DeepGEMM
+- 在 `model_executor/kernels/linear/scaled_mm/deep_gemm.py` 中让 `DeepGemmFp8BlockScaledMMKernel` 在 SM120/SM121 返回 unsupported
+- 这样 vLLM 的普通 FP8 block linear 会跳过 DeepGEMM / FlashInfer+DeepGEMM 动态 kernel，落到后续非 DeepGEMM kernel
+
+镜像已重建并同步双机：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: ac1aa7fa36fc
+```
+
+容器内检查：
+
+```text
+DeepGemmFp8BlockScaledMMKernel.is_supported()
+=> (False, 'Consumer-DeepGEMM on SM120/SM121 is only enabled for DeepSeek V4 MoE FP4; ordinary FP8 linear should use the non-DeepGEMM vLLM kernels.')
+```
+
+### 追加：DeepGEMM warmup 也要跳过普通 FP8 linear
+
+继续启动后，`determine_available_memory` 已通过，说明普通 forward dummy run 不再走 DeepGEMM FP8 linear；但 `compile_or_warm_up_model` 阶段的 DeepGEMM warmup 仍然独立扫描模型里的 FP8 linear module，并直接调用 `fp8_gemm_nt`：
+
+```text
+vllm/model_executor/warmup/deep_gemm_warmup.py
+deepgemm_fp8_gemm_nt_warmup -> fp8_gemm_nt -> Consumer fallback
+RuntimeError: The size of tensor a (1536) must match the size of tensor b (12)
+```
+
+处理：在 `deep_gemm_warmup.py` 的 `_fp8_linear_may_use_deep_gemm()` 中，SM120/SM121 直接返回 `False`。这样普通 FP8 linear 的 warmup 统计和实际 warmup 都跳过；MoE grouped warmup 保留。
+
+镜像已再次重建并同步双机：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: ab948bd4d9d9
+```
+
+### 当前停止点：服务已启动，但首个请求返回 500
+
+Zero 在本机验证当前镜像：
+
+```bash
+docker run --rm --gpus all vllm-node-sm121-cdg:latest bash -lc 'python3 - <<PY
+import consumer_deep_gemm as dg
+import vllm.third_party.deep_gemm as vdg
+print("consumer", dg.native_build_info())
+print("vllm", vdg.native_build_info())
+PY'
+```
+
+输出确认镜像内 shim 和 native extension 均存在：
+
+```text
+consumer {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+vllm {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+随后 `curl /v1/chat/completions` 已能连上服务，但返回：
+
+```text
+{"error":{"message":"EngineCore encountered an issue. See stack trace (above) for the root cause.","type":"InternalServerError","param":null,"code":500}}
+Total time: 14.863565s
+```
+
+这说明服务已经越过了前面的模型加载、KV cache profile、compile/warmup 阶段，至少 HTTP server 已可接请求；当前问题进入“真实请求 forward / decode”阶段。
+
+已做的最小观察：
+
+- 本机 `docker ps` 看到正在运行的容器名为 `ray-head`，image 显示 `nvcr.io/nvidia/vllm:26.03-py3-dsv4`
+- 这不一定代表没用 `vllm-node-sm121-cdg`，因为 launch 脚本可能保留底层 image metadata / 容器名；但下一轮需要先确认 `ray-head` 内实际文件是否为新镜像内容
+- `docker logs --tail 500 ray-head` 只看到旧的 NGC banner 和 driver compatibility 信息，没有抓到这次 500 对应的完整 traceback；需要扩展日志抓取范围或进入容器查 Ray/vLLM worker 日志
+
+下一轮建议入口：
+
+1. 先确认正在跑的 `ray-head` 容器内是否确实是 `ab948bd4d9d9` 这版内容：
+
+   ```bash
+   docker exec ray-head python3 - <<'PY'
+   import consumer_deep_gemm as dg
+   import vllm.third_party.deep_gemm as vdg
+   from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import DeepGemmFp8BlockScaledMMKernel
+   from vllm.platforms import current_platform
+   print("consumer", dg.native_build_info())
+   print("vllm", vdg.native_build_info())
+   print("family120", current_platform.is_device_capability_family(120))
+   print("fp8_linear_deepgemm_supported", DeepGemmFp8BlockScaledMMKernel.is_supported())
+   PY
+   ```
+
+2. 抓真实请求的 EngineCore / Ray worker traceback：
+
+   ```bash
+   docker logs --since 10m ray-head 2>&1 | grep -A180 -B40 -E 'ERROR|Traceback|InternalServerError|EngineCore encountered'
+   ```
+
+   如果 stdout 仍没有完整栈，再查容器内 Ray session logs：
+
+   ```bash
+   docker exec ray-head bash -lc 'find /tmp/ray -type f \( -name "*.out" -o -name "*.err" -o -name "*.log" \) -mmin -30 | sort | tail -80'
+   ```
+
+3. 根据新 traceback 判断是：
+   - Consumer-DeepGEMM native grouped FP8×FP4 forward 真实形态不匹配
+   - vLLM 某条普通 FP8 / attention / TileLang 路径仍被 DeepGEMM warmup 之外的逻辑误接管
+   - 或启动容器并非最新 `vllm-node-sm121-cdg`
+
+当前工作状态：先停在这里，不继续追。主线仍是“解决输出异常”，但下一步必须以这次 500 的真实服务端 traceback 为准。
