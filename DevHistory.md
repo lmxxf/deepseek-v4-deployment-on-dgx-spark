@@ -576,6 +576,87 @@ docker run --rm --gpus all \
 
 这个判断要记住：**79d 是 plumbing 来源，不是目标算子本体。**
 
+**2026-05-03 追加：CUTLASS FP8×FP4 grouped 类型探针通过**
+
+在 Consumer-DeepGEMM 新增 `csrc/cutlass_mxfp8_mxfp4_probe.cu`：
+
+- 单 GEMM 类型探针通过：
+  - `ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>`
+  - `ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>`
+  - `ElementD = cutlass::bfloat16_t`
+  - `ArchTag = cutlass::arch::Sm120`
+- grouped pointer-array 类型探针通过：
+  - `GroupProblemShape<Shape<int,int,int>>`
+  - `ElementA, LayoutATag*`
+  - `ElementB, LayoutBTag*`
+  - grouped epilogue 必须用 `LayoutCTag*` / `LayoutDTag*`
+- `GroupedGemm::Arguments` 构造类型探针通过：
+  - problem shape
+  - ptr arrays
+  - stride arrays
+  - SFA/SFB layout arrays
+  - epilogue fusion args
+  - scheduler args
+
+验证命令：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh'
+```
+
+输出：
+
+```text
+{'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+结论：SM120 上 `mx_float8 × mx_float4 -> bf16` + grouped pointer-array 不是死路，CUTLASS 类型系统已经接受。下一步从类型探针推进到真实 CUDA tensor 指针数组、workspace、`can_implement()`，再到真正 launch。
+
+**2026-05-03 追加：真实 CUDA tensor 的 `can_implement()` probe 通过**
+
+继续推进 `csrc/cutlass_mxfp8_mxfp4_probe.cu`：
+
+- 新增 `cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d)`
+- 从真实 CUDA tensor shape 推出：
+  - `groups = b.size(0)`
+  - `M = a.size(0)`
+  - `K = a.size(1)`
+  - `N = b.size(1)`
+- 构造 grouped `problem_sizes`
+- 构造 `stride_A/B/C/D`
+- 构造 `layout_SFA/SFB`
+- 构造 epilogue fusion args、hardware info、scheduler args
+- 调用 `GroupedGemm::can_implement(arguments)`
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc 'PYTHONPATH=/work/Consumer-DeepGEMM python3 - <<PY
+import torch
+from consumer_deep_gemm import native
+a = torch.empty((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+b = torch.empty((2, 128, 64), device="cuda", dtype=torch.int8)
+d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+print(native.cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d))
+PY'
+```
+
+输出：
+
+```text
+True
+```
+
+同时把这个检查加入 `tests/test_native_abi.py`。当前阶段已经从“类型能编”推进到“CUTLASS 对真实 CUDA tensor 推出的 grouped problem 返回 can_implement=True”。下一阶段才进入真实 pointer arrays / workspace / `initialize()` / `run()`。
+
 下一步：
 
 1. 从 72c/79c + 79d 组合出 FP8×FP4 grouped BF16 kernel
