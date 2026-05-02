@@ -552,9 +552,33 @@ docker run --rm --gpus all \
 
 结果通过。下一步可以把当前 Consumer-DeepGEMM 合入 vLLM Docker 做安装链路测试；真实长输出修复仍依赖 CUTLASS 79d kernel 接入。
 
+**2026-05-03 追加：CUTLASS 例子路线修正**
+
+继续拆 79d 时发现一个重要问题：`79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 本体不是 vLLM 需要的算子。
+
+- 79d：NVFP4 × NVFP4 grouped GEMM，并且输出也是 FP4 + 输出 scale factor
+- vLLM / DeepSeek V4 FP4 MoE 实际需要：FP8 activation × packed FP4 weight -> BF16 output
+- 更接近的非 grouped 例子是：
+  - `72c_blackwell_mixed_mxfp8_bf16_gemm.cu`
+  - `79c_blackwell_geforce_mixed_mxfp8_mxfp6_bf16_gemm.cu`（混合窄精度形态更接近，但 B 是 FP6 示例）
+- 79d 仍然有价值，但价值在 grouped pointer-array plumbing：
+  - `GroupProblemShape<Shape<int,int,int>>`
+  - `ptr_A/ptr_B/ptr_SFA/ptr_SFB/ptr_D`
+  - `stride_A/stride_B/layout_SFA/layout_SFB/stride_D`
+  - `GemmUniversalMode::kGrouped`
+
+正确路线不是机械搬 79d，而是：
+
+1. 用 72c/79c 的 FP8×FP4/MX narrow precision BF16 epilogue 定 kernel 类型
+2. 用 79d 的 grouped problem 和 pointer-array launch 结构
+3. 第一版只支持 vLLM 实际路径：`A[M,K]`、`B[G,N,K/2]`、`D[M,N]`、per-row `expert_ids`
+4. 如果 CUTLASS 类型系统不接受 FP8×NVFP4 这个组合，再退一步做 explicit dequant + BF16 grouped GEMM 正确性 kernel，先消灭 Marlin 静默错误，再谈性能
+
+这个判断要记住：**79d 是 plumbing 来源，不是目标算子本体。**
+
 下一步：
 
-1. 从 CUTLASS `79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 拆出库函数
+1. 从 72c/79c + 79d 组合出 FP8×FP4 grouped BF16 kernel
 2. 先实现 `m_grouped_fp8_fp4_gemm_nt_contiguous`
 3. Python API 已经接好 native 优先、fallback 兜底
 4. 接上真实 kernel 后，再集成 vLLM 服务验证长输出垃圾是否消失
