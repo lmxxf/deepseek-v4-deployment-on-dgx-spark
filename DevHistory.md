@@ -869,4 +869,101 @@ Total time: 14.863565s
    - vLLM 某条普通 FP8 / attention / TileLang 路径仍被 DeepGEMM warmup 之外的逻辑误接管
    - 或启动容器并非最新 `vllm-node-sm121-cdg`
 
-当前工作状态：先停在这里，不继续追。主线仍是“解决输出异常”，但下一步必须以这次 500 的真实服务端 traceback 为准。
+当前工作状态：先停在这里，不继续追。主线仍是”解决输出异常”，但下一步必须以这次 500 的真实服务端 traceback 为准。
+
+### 2026-05-03 下午：Bug 修复 + Scale Reorder + 输出正确性验证 ✅
+
+本轮解决了从”服务 500 错误”到”长输出全是空/垃圾”的全部问题链。
+
+#### Bug 修复（Python 层）
+
+1. **`segments_from_indices` 不支持非连续 expert_ids**（C++ 侧）
+   - 旧：同组行必须连续，否则退回 Python fallback（太慢）
+   - 新：引入 scatter/gather——按 group 排序行到临时 buffer，CUTLASS launch 在连续 buffer 上执行，结果 scatter 回原始位置
+
+2. **`m_grouped_fp8_gemm_nt_contiguous` 等 6 个 grouped/masked 函数忽略 `m_indices`/`masked_m`**
+   - 全部修复为正确按 group 路由
+
+3. **`fp8_einsum` 忽略 scale factors**
+   - 修复为正确 dequantize
+
+4. **`_float_scale_to_e8m0` 用 `ceil` 而非 `round`**
+   - 改用 `torch.round`
+
+5. **`per_block_cast_to_fp8`/`per_token_cast_to_fp8` 返回 dummy scale=1.0**
+   - 修复为正确计算 per-block/per-token amax 并缩放
+
+6. **`get_paged_mqa_logits_metadata` 返回 `None`**
+   - 根因：vLLM MLA indexer 调这个函数拿 SM work distribution metadata，`None` 赋给 CUDA IntTensor 直接炸
+   - 实现了完整的 Python fallback：prefix sum + binary search 分配 KV segments 到 SMs，输出 `[num_sms+1, 2]` int32 tensor
+
+7. **`pip install -e .` editable 安装导致 `deep_gemm` 顶层包在 docker commit 后丢失**
+   - `_lazy_init` 找不到 `get_mk_alignment_for_contiguous_layout` → RuntimeError
+   - 改成 `pip install .` 非 editable + 带 CUDA 编译，`install_in_vllm_container.sh` 先 build native 再 pip install
+
+8. **`gpu-memory-utilization=0.85` 导致 slave OOM**
+   - 降到 0.80，slave 不再被 OOM killer 杀
+
+#### Scale Factor Layout 修复（核心）
+
+**根因**：CUTLASS SM120 的 block-scaled MX kernel 对 scale factor 有特殊的 SfAtom tile-interleaved 内存布局要求，与 vLLM 传来的 row-major `[M, K/128]` 不同。
+
+SfAtom K-major layout:
+```
+Shape:  ((32, 4), (SFVecSize, 4))
+Stride: ((16, 4), (0, 1))
+```
+
+vLLM 的 activation scale 是 `[M, K/128]`（每 128 个 K 元素一个 scale），但 CUTLASS 的 SFVecSize=32（每 32 个 K 元素一个 scale）。需要：
+1. `repeat_interleave(4)` 把 `[M, K/128]` 扩展成 `[M, K/32]`
+2. 按 SfAtom 的 tile 结构重排：`[m_tiles, k_tiles, m_in_32, m_32, k_in_4]` with strides `(*, *, 16, 4, 1)`
+
+**修复方案**：在 C++ 侧 `launch_grouped_fp8_fp4` 内部，每个 group 独立做 scale reorder。CPU 侧 `reorder_scale_for_cutlass()` 函数按 SfAtom offset 公式 `m_in_32*16 + m_32*4 + k_in_4` 逐元素重排，然后 copy 到 device。SFA 和 SFB 都做 per-group reorder，避免了 Python 侧全局 reorder 破坏 grouped pointer offset 的问题。
+
+padding 用 E8M0=127（=2^0=1.0）而非 0（=2^-127≈0），否则 padding 位置会把结果缩放到零。
+
+#### 验证结果
+
+```
+短输出测试：
+“2+2等于几” → “2+2 等于 **4**。” ✅ (29s, 10 tokens)
+
+长输出测试：
+“请用500字介绍万里长城” → 完整的 420 token 高质量中文 ✅ (542s)
+finish_reason: stop（模型自己决定停止）
+```
+
+#### 性能现状
+
+~1.3 秒/token。瓶颈是 CPU 侧 per-group scale reorder（每次 forward 都要 CPU↔GPU 同步做 reorder），256 个专家 × 60 层 = 每个 token 上万次 CPU reorder + H2D copy。
+
+#### 性能优化方向（待做）
+
+1. 把 `reorder_scale_for_cutlass` 移到 GPU kernel 里（一次 launch 搞定）
+2. 模型加载时一次性预重排所有 weight scale（SFB 是静态的），运行时只重排 SFA
+3. SFA 重排融合到 MoE scatter kernel
+4. 去掉诊断日志（`_fp4_diag_count`）
+
+#### 当前双机镜像
+
+```text
+vllm-node-sm121-cdg:latest
+image id: fb24611f4f22
+```
+
+#### 启动命令
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1” \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-sm121-cdg exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 1000000 \
+  --enforce-eager
+```
