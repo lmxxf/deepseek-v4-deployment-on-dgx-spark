@@ -933,22 +933,30 @@ padding 用 E8M0=127（=2^0=1.0）而非 0（=2^-127≈0），否则 padding 位
 finish_reason: stop（模型自己决定停止）
 ```
 
-#### 性能现状
+#### 性能优化：GPU scale reorder（2026-05-03 晚）
 
-~1.3 秒/token。瓶颈是 CPU 侧 per-group scale reorder（每次 forward 都要 CPU↔GPU 同步做 reorder），256 个专家 × 60 层 = 每个 token 上万次 CPU reorder + H2D copy。
+Scale reorder 从 CPU (`reorder_scale_for_cutlass` 逐元素重排 + H2D copy) 改成 GPU CUDA kernel (`reorder_scale_kernel` + `reorder_scale_on_gpu`)。SFA 和 SFB 都在 GPU 上完成重排。
+
+结果：518s vs 542s，几乎无变化。瓶颈不在 reorder 计算本身，而在：
+
+1. **`m_indices.to(kCPU)` 同步**：每次 CUTLASS launch 都要把 expert_ids 拷回 CPU 做 segment 解析，120 次/token（60 层 × 2 FC），每次都是 GPU→CPU 同步屏障
+2. **Per-launch tensor 分配**：每次 launch 分配 SFA/SFB buffer + pointer array device tensors
+3. **Host-side vector → device copy**：problem_sizes、strides、layouts、pointer arrays 全部从 CPU vector 拷到 GPU
+
+~1.2 s/token 对 280B MoE 来说是 CUTLASS grouped GEMM 的 launch overhead 决定的，不是计算本身。
 
 #### 性能优化方向（待做）
 
-1. 把 `reorder_scale_for_cutlass` 移到 GPU kernel 里（一次 launch 搞定）
-2. 模型加载时一次性预重排所有 weight scale（SFB 是静态的），运行时只重排 SFA
-3. SFA 重排融合到 MoE scatter kernel
-4. 去掉诊断日志（`_fp4_diag_count`）
+1. **`segments_from_indices` GPU 化**：把 expert_ids 解析移到 GPU kernel，消除 120 次/token 的 GPU→CPU 同步
+2. **SFB 一次性预重排**：模型加载时对所有专家的 weight scale 做一次 SfAtom reorder 存回去，运行时直接用 pointer 偏移
+3. **Pointer array 预分配**：把 problem_sizes/strides/layouts 缓存到固定 device buffer，只更新变化的 M 值
+4. **去掉诊断日志**（`_fp4_diag_count`）
 
 #### 当前双机镜像
 
 ```text
 vllm-node-sm121-cdg:latest
-image id: fb24611f4f22
+image id: 403bb0b47ec5
 ```
 
 #### 启动命令
