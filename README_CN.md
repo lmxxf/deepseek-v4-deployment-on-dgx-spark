@@ -20,6 +20,16 @@
 - **host (spark-3a10)**：192.168.31.198 / CX7: 169.254.248.35
 - **slave (spark-e8bb)**：192.168.31.172 / CX7: 169.254.30.81
 
+## 预构建镜像
+
+不想自己编译的话，直接拉取（ARM64/aarch64 only）：
+
+```bash
+docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
+```
+
+基于 jasl/vllm `ds4-sm120` 分支（2026-05-04），跳到第 4 步启动服务，把 `-t vllm-node-jasl` 改成 `-t lmxxf/vllm-deepseek-v4-dgx-spark`。
+
 ## 从零开始
 
 ### 1. 双机组网
@@ -113,22 +123,22 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
 # 短输出测试（中文，应正确）
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # 长输出测试（中文，应正确，~14 tok/s）
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # 代码测试（中文 prompt，应正确）
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # 英文测试（已知问题：可能出现垃圾 token）
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 ```
 
 预期结果：

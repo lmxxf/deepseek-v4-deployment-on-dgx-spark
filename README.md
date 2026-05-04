@@ -13,6 +13,14 @@ Run **DeepSeek V4 Flash (280B, FP4)** on two **NVIDIA DGX Spark** nodes (128GB x
 
 Uses [jasl/vllm](https://github.com/jasl/vllm/tree/ds4-sm120) fork with Triton-rewritten kernels, bypassing Marlin's silent computation errors on SM120+. English issue is known; tracking jasl's ongoing work and vLLM issue #40928.
 
+## Pre-built Docker Image
+
+```bash
+docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
+```
+
+Based on jasl/vllm `ds4-sm120` branch (2026-05-04). Skip to [Step 4](#4-start-inference), replace `-t vllm-node-jasl` with `-t lmxxf/vllm-deepseek-v4-dgx-spark`.
+
 ## Hardware Requirements
 
 - 2x NVIDIA DGX Spark (128GB unified memory each, GPU: GB10 sm_121)
@@ -112,22 +120,22 @@ Must run `stop` before restarting — otherwise the worker node's container keep
 # Short output (Chinese, should be correct)
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # Long output (Chinese, should be correct, ~14 tok/s)
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # Code generation (Chinese prompt, should be correct)
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 
 # English test (known issue: may produce garbage tokens)
 curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -m json.tool
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
 ```
 
 Expected results:
