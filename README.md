@@ -4,13 +4,14 @@
 
 Run **DeepSeek V4 Flash (280B, FP4)** on two **NVIDIA DGX Spark** nodes (128GB x2) connected via ConnectX-7 200Gbps RDMA.
 
-## Pre-built Docker Image
+## Current Status (2026-05-04)
 
-```bash
-docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
-```
+| Scenario | Status | Speed |
+|----------|--------|-------|
+| Chinese Q&A / writing / code | Perfect | ~14 tok/s |
+| English Q&A / code | Occasional garbage tokens at start | ~14 tok/s |
 
-Skip to [Step 4](#4-start-inference) if using the pre-built image.
+Uses [jasl/vllm](https://github.com/jasl/vllm/tree/ds4-sm120) fork with Triton-rewritten kernels, bypassing Marlin's silent computation errors on SM120+. English issue is known; tracking jasl's ongoing work and vLLM issue #40928.
 
 ## Hardware Requirements
 
@@ -51,68 +52,56 @@ Sync to **worker node** via CX7 (581MB/s):
 rsync -avP ./deepseek-v4-flash/ user@<worker_CX7_IP>:./deepseek-v4-flash/
 ```
 
-### 3. Build Docker Image (skip if using pre-built)
+### 3. Build Docker Image
 
-The solution combines three projects:
-- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) - DGX Spark Docker infrastructure
-- [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120) - SM120 Triton fallback kernels
-- [zyang-dev/nccl](https://github.com/zyang-dev/nccl/tree/dgxspark-3node-ring) - NCCL mesh support
+The solution combines two projects:
+- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) - DGX Spark Docker infrastructure (NCCL, PyTorch, FlashInfer, Ray)
+- [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120) - Triton-rewritten kernels for SM120+ (sparse MLA, FP8 einsum, paged MQA)
 
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-
-# Pre-clone dependencies (Docker build can't access GitHub)
-git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git nccl-src
-git clone --depth 1 -b ds4-sm120 https://github.com/jasl/vllm.git vllm-sm120
-
-# Remove hash locks from vllm requirements
-find vllm-sm120/ -name "*.txt" -path "*/require*" -exec sed -i '/--hash/d; s/ \\$//' {} +
 ```
 
-Key Dockerfile modifications:
-- Replace `git clone` with `COPY nccl-src/` and `COPY vllm-sm120/`
-- Build vLLM from jasl source instead of pre-built wheels
-- Set `TORCH_CUDA_ARCH_LIST="12.0"` + `CMAKE_CUDA_ARCHITECTURES="120-real"` (sm_120 forward-compatible with sm_121)
-- Add build deps: `cmake`, `setuptools_scm`, `setuptools>=75,<81`, `pybind11`
+Modify Dockerfile line 190 — change the vLLM clone URL:
+
+```diff
+- git clone --recursive https://github.com/vllm-project/vllm.git
++ git clone --recursive https://github.com/jasl/vllm.git
+```
+
+Build and sync to worker:
 
 ```bash
-# Build and auto-copy to worker (~1 hour on Grace CPU)
-./build-and-copy.sh -t vllm-node-sm120 -c
+./build-and-copy.sh -t vllm-node-jasl -c <worker_CX7_IP> --vllm-ref ds4-sm120
 ```
+
+~30 minutes compile + ~1 minute sync.
 
 ### 4. Start Inference
 
 ```bash
 HF_HOME=/path/to/weights/parent \
-./launch-cluster.sh -t vllm-node-sm120 exec \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
-  --max-model-len 1000000 \
+  --max-model-len 131072 \
   --enforce-eager
 ```
 
-Or with pre-built image:
-
-```bash
-HF_HOME=/path/to/weights/parent \
-./launch-cluster.sh -t lmxxf/vllm-deepseek-v4-dgx-spark exec \
-  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
-  --tensor-parallel-size 2 \
-  --distributed-executor-backend ray \
-  --gpu-memory-utilization 0.85 \
-  --kv-cache-dtype fp8 \
-  --max-model-len 1000000 \
-  --enforce-eager
-```
+Key flags:
+- `--enforce-eager`: Disable CUDA graph (SM120+ compatibility)
+- `--kv-cache-dtype fp8`: Required by DeepSeek V4
+- `--max-model-len 131072`: 128K context, adjust as needed
 
 ### 5. Stop
 
 ```bash
-./launch-cluster.sh -t vllm-node-sm120 stop
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl stop
 ```
 
 Must run `stop` before restarting — otherwise the worker node's container keeps running.
@@ -171,29 +160,31 @@ Client -> head:8000 (vLLM API)
 
 | Problem | Solution |
 |---------|----------|
-| DeepSeek V4 too new for NGC 26.03 | jasl/vllm ds4-sm120 fork with Triton fallback |
-| DeepGEMM doesn't support sm_121 | TileLang kernels replace hyperconnection |
-| PyTorch only ships sm_120 kernels | `TORCH_CUDA_ARCH_LIST="12.0"`, sm_120 forward-compatible with sm_121 |
-| Docker build can't reach GitHub | Pre-clone on host, COPY into container |
-| vLLM requirements hash mismatch | `sed` to remove all `--hash` lines |
-| NGC torch can't be pip-upgraded | Use community torch from PyTorch whl index |
+| Marlin FP4 MoE silent errors on SM120+ | jasl/vllm fork rewrites critical kernels in Triton, bypasses Marlin |
+| DeepGEMM doesn't support SM120+ | jasl fork includes Triton fallbacks |
+| vLLM 0.20.x doesn't fix SM120+ MXFP4 MoE | Use jasl fork instead of official main |
+| PR #40082 (FlashInfer b12x) doesn't help V4 | b12x only registered in NVFP4 oracle; V4 uses MXFP4 |
+| English output has occasional garbage tokens | Known issue; awaiting jasl's coverage of remaining Marlin paths |
+
+## Solution Comparison
+
+| Approach | Chinese | English | Speed | Status |
+|----------|---------|---------|-------|--------|
+| vLLM official main | Silent errors | Silent errors | N/A | Broken |
+| Consumer-DeepGEMM (CUTLASS replace Marlin) | Correct | Correct | 0.8 tok/s | Correct but too slow |
+| **jasl/vllm fork (recommended)** | **Correct** | **Occasional garbage** | **14 tok/s** | **Usable for Chinese** |
+| eugr exp-b12x (PR #40082) | N/A | N/A | N/A | Not applicable to V4 |
 
 ## Troubleshooting
 
-See [DevHistory.md](DevHistory.md) for the full 48-hour, 18-pitfall journey.
+See [DevHistory.md](DevHistory.md) for the full journey.
 
-## Known Limitations
+## Related Links
 
-- `--enforce-eager` required (torch.compile not yet compatible with SM120 kernels)
-- SM121 runs SM120 kernels via forward compatibility (minor performance overhead possible)
-- DeepSeek V4 ecosystem is still maturing (released 2026-04-24)
-
-## Credits
-
-- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
-- [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120)
-- [zyang-dev/nccl](https://github.com/zyang-dev/nccl/tree/dgxspark-3node-ring)
-- [NVIDIA DGX Spark Playbooks](https://github.com/NVIDIA/dgx-spark-playbooks)
+- jasl fork: https://github.com/jasl/vllm (branch ds4-sm120, PR #40991)
+- eugr build tool: https://github.com/eugr/spark-vllm-docker
+- Consumer-DeepGEMM: https://github.com/lmxxf/Consumer-DeepGEMM (CUTLASS approach, correct but slow, educational)
+- vLLM issues: https://github.com/vllm-project/vllm/issues/40928 https://github.com/vllm-project/vllm/issues/41063
 
 ## License
 

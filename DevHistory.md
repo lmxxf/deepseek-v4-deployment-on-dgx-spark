@@ -959,7 +959,7 @@ vllm-node-sm121-cdg:latest
 image id: 403bb0b47ec5
 ```
 
-#### 启动命令
+#### 启动命令（Consumer-DeepGEMM 版，已废弃）
 
 ```bash
 cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
@@ -975,3 +975,74 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1”
   --max-model-len 1000000 \
   --enforce-eager
 ```
+
+---
+
+## 第八阶段：jasl/vllm fork 重新构建（2026-05-04）
+
+Consumer-DeepGEMM 正确但太慢（0.8 tok/s），转向社区方案。
+
+### 背景
+
+jasl（GitHub: github.com/jasl/vllm，分支 ds4-sm120）用 Triton 重写了 DeepSeek V4 的关键 kernel（sparse MLA、FP8 einsum、paged MQA 等），绕过 Marlin 走完全不同的计算路径。PR #40991 提给 vLLM 官方（draft 状态）。社区已有多人在 DGX Spark 上验证 ~15-22 tok/s。
+
+### 构建
+
+eugr/spark-vllm-docker 更新到最新（多了 `mods/exp-b12x/run.sh`），jasl/vllm 的 `ds4-sm120` 分支也大幅更新（+31000 行，454 文件变更）。
+
+构建方法：改 Dockerfile 第 190 行 clone URL 从 `vllm-project/vllm` 改成 `jasl/vllm`：
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+# Dockerfile 第 190 行改为: git clone --recursive https://github.com/jasl/vllm.git
+./build-and-copy.sh -t vllm-node-jasl -c 169.254.30.81 --vllm-ref ds4-sm120
+```
+
+编译 30 分钟，copy 1 分钟。
+
+### 实测结果
+
+| Prompt | 结果 | Tokens | 时间 | 速度 |
+|--------|------|--------|------|------|
+| “2+2等于几” | ✅ 正确 “4” | 10 | 16.8s（含 warmup） | — |
+| “请用500字介绍万里长城” | ✅ 完美中文 | 414 | 29.3s | ~14 tok/s |
+| “写一个Python快速排序函数” | ✅ 完美代码 | 500 | 36.5s | ~13.7 tok/s |
+| “What is quicksort? Explain with code.” | ❌ 全程垃圾 | 500 | 35.7s | — |
+| “什么是快速排序？用英文解释并给出代码。” | ⚠️ 开头垃圾，后半修正 | 500 | 35.4s | — |
+
+**中文完美，英文有残留问题。** 社区已知 “occasional spurious tokens”——jasl 用 Triton 重写了大部分路径，但可能有少量 fallback 仍走原始 Marlin 代码。
+
+速度对比：Consumer-DeepGEMM 0.8 tok/s → jasl fork **14 tok/s**，快 18 倍。
+
+### 还试了 eugr exp-b12x 方案（走不通）
+
+PR #40082（meena-at-work/vllm 的 `integrate-flashinfer-b12x-moe` 分支）的 FlashInfer CuTeDSL b12x backend 只注册在 **NVFP4** oracle 中，DeepSeek V4 Flash 用的是 **MXFP4**，走的是完全不同的 backend 选择路径。对 DeepSeek V4 无效。
+
+### 当前推荐镜像
+
+```text
+vllm-node-jasl:latest
+```
+
+### 当前推荐启动命令
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1” \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 131072 \
+  --enforce-eager
+```
+
+### 待解决
+
+- 英文输出垃圾——等 jasl 继续覆盖残余 Marlin 路径，或等 vLLM 官方修复（issue #40928）
+- vLLM 0.20.0/0.20.1 没有修复 sm_120+ MXFP4 MoE 问题
+- DeepGEMM 明确不打算支持 sm_120+

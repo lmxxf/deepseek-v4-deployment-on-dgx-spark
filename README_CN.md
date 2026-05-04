@@ -4,22 +4,21 @@
 
 两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 运行 DeepSeek V4 Flash (280B, 158GB FP4)。
 
+## 当前状态（2026-05-04）
+
+| 场景 | 状态 | 速度 |
+|------|------|------|
+| 中文问答/写作/代码 | 完美 | ~14 tok/s |
+| 英文问答/代码 | 偶尔开头出垃圾 token | ~14 tok/s |
+
+基于 jasl/vllm fork（`ds4-sm120` 分支），用 Triton 重写了 DeepSeek V4 的关键 kernel，绕过 Marlin 在 sm_120+ 上的静默计算错误。英文残留问题是社区已知的，等 jasl 继续覆盖残余路径或 vLLM 官方修复（issue #40928）。
+
 ## 硬件
 
 - DGX Spark ×2，各 128GB 统一内存，GPU: NVIDIA GB10 (sm_121)
 - QSFP56 DAC 线缆，ConnectX-7 200Gbps RDMA 直连
 - **host (spark-3a10)**：192.168.31.198 / CX7: 169.254.248.35
 - **slave (spark-e8bb)**：192.168.31.172 / CX7: 169.254.30.81
-
-## 预构建镜像
-
-不想自己编译的话，直接拉取预构建镜像（ARM64/aarch64 only）：
-
-```bash
-docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
-```
-
-然后跳到第 4 步启动推理服务，把 `-t vllm-node-sm120` 改成 `-t lmxxf/vllm-deepseek-v4-dgx-spark`。
 
 ## 从零开始
 
@@ -57,49 +56,53 @@ rsync -avP /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/ \
 
 ### 3. 构建 Docker 镜像
 
-核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork（sm_120 Triton fallback）。
+核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork（Triton 重写 DeepSeek V4 关键 kernel）。
 
 ```bash
 # 克隆构建工具
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-
-# 克隆依赖源码（Docker 内无法访问 GitHub）
-git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git nccl-src
-git clone --depth 1 -b ds4-sm120 https://github.com/jasl/vllm.git vllm-sm120
-
-# 删除 vllm requirements 里的 hash 锁定
-find vllm-sm120/ -name "*.txt" -path "*/require*" -exec sed -i '/--hash/d; s/ \\$//' {} +
 ```
 
-修改 Dockerfile（关键改动）：
-- NCCL：`COPY nccl-src/` 替代 `git clone`
-- vLLM：用 jasl 源码编译替代预编译 whl，`TORCH_CUDA_ARCH_LIST="12.0"` + `CMAKE_CUDA_ARCHITECTURES="120-real"`
-- 额外依赖：`cmake`、`setuptools_scm`、`setuptools>=75,<81`、`pybind11`
+修改 Dockerfile 第 190 行的 clone URL：
+
+```diff
+- git clone --recursive https://github.com/vllm-project/vllm.git
++ git clone --recursive https://github.com/jasl/vllm.git
+```
+
+构建并同步到 slave：
 
 ```bash
-# 构建并自动复制到 slave（约 1 小时）
-./build-and-copy.sh -t vllm-node-sm120 -c
+./build-and-copy.sh -t vllm-node-jasl -c <slave_CX7_IP> --vllm-ref ds4-sm120
 ```
+
+约 30 分钟编译 + 1 分钟同步。
 
 ### 4. 启动推理服务
 
 ```bash
 HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
-./launch-cluster.sh -t vllm-node-sm120 exec \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
-  --max-model-len 1000000 \
+  --max-model-len 131072 \
   --enforce-eager
 ```
+
+关键参数：
+- `--enforce-eager`：禁用 CUDA graph（sm_120+ 兼容性问题）
+- `--kv-cache-dtype fp8`：DeepSeek V4 要求 FP8 KV cache
+- `--max-model-len 131072`：128K 上下文，可按需调整
 
 ### 5. 停止
 
 ```bash
-./launch-cluster.sh -t vllm-node-sm120 stop
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl stop
 ```
 
 重启前必须先 stop——否则 slave 上的容器还在跑。不要直接 ctrl-c。
@@ -155,12 +158,28 @@ DeepSeek V4 Flash 采用 CSA + HCA 混合注意力架构，KV cache 极小——
 
 | 问题 | 解法 |
 |------|------|
-| DeepSeek V4 太新，NGC 26.03 不支持 | jasl/vllm ds4-sm120 fork，Triton fallback |
-| DeepGEMM 不支持 sm_121 | jasl fork 用 TileLang 重写 hyperconnection kernel |
-| torch 社区版只到 sm_120 | 编译时 `TORCH_CUDA_ARCH_LIST="12.0"`，sm_120 前向兼容 sm_121 |
-| Docker 内无法访问 GitHub | 宿主机预先 clone，COPY 进容器 |
-| vLLM requirements hash 锁定 | `sed` 删除所有 `--hash` 行 |
+| Marlin FP4 MoE 在 sm_120+ 静默算错 | jasl/vllm fork 用 Triton 重写关键 kernel，绕过 Marlin |
+| DeepGEMM 不支持 sm_121 | jasl fork 内置 Triton fallback |
+| vLLM 0.20.x 未修复 sm_120+ MXFP4 MoE | 使用 jasl fork 而非官方 main |
+| PR #40082 (FlashInfer b12x) 对 V4 无效 | b12x 只注册在 NVFP4 oracle，V4 用 MXFP4 |
+| 英文输出偶尔有垃圾 token | 已知问题，等 jasl 继续覆盖残余 Marlin 路径 |
+
+## 方案对比
+
+| 方案 | 中文 | 英文 | 速度 | 状态 |
+|------|------|------|------|------|
+| vLLM 官方 main | 静默算错 | 静默算错 | N/A | 不可用 |
+| Consumer-DeepGEMM（CUTLASS 替换 Marlin） | 正确 | 正确 | 0.8 tok/s | 正确但太慢 |
+| **jasl/vllm fork（推荐）** | **正确** | **偶尔垃圾** | **14 tok/s** | **中文日常可用** |
+| eugr exp-b12x (PR #40082) | N/A | N/A | N/A | 不适用 DeepSeek V4 |
+
+## 相关链接
+
+- jasl fork: https://github.com/jasl/vllm （分支 ds4-sm120，PR #40991）
+- eugr 构建工具: https://github.com/eugr/spark-vllm-docker
+- Consumer-DeepGEMM: https://github.com/lmxxf/Consumer-DeepGEMM （CUTLASS 方案，正确但慢，学习用）
+- vLLM issue: https://github.com/vllm-project/vllm/issues/40928 https://github.com/vllm-project/vllm/issues/41063
 
 ## 踩坑详情
 
-见 [DevHistory.md](DevHistory.md)——48 小时，18 个坑的完整记录。
+见 [DevHistory.md](DevHistory.md)——完整记录。
