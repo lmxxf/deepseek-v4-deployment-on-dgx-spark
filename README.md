@@ -109,10 +109,37 @@ Must run `stop` before restarting — otherwise the worker node's container keep
 ### 6. Test
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+# Short output (Chinese, should be correct)
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -m json.tool
+
+# Long output (Chinese, should be correct, ~14 tok/s)
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -m json.tool
+
+# Code generation (Chinese prompt, should be correct)
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -m json.tool
+
+# English test (known issue: may produce garbage tokens)
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -m json.tool
 ```
+
+Expected results:
+
+| Test | Expected | Speed |
+|------|----------|-------|
+| Chinese short (2+2) | Correct | First request ~17s (warmup), then <1s |
+| Chinese long (Great Wall) | Correct, finish_reason=stop | ~14 tok/s |
+| Chinese code (quicksort) | Correct, runnable code | ~14 tok/s |
+| English code (quicksort) | May produce garbage tokens | ~14 tok/s |
+
+Chinese correct + English broken = deployment successful (known jasl fork limitation).
 
 ## Memory Budget (Dual Spark, 256GB total)
 

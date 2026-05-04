@@ -110,10 +110,37 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
 ### 6. 测试
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+# 短输出测试（中文，应正确）
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"max_tokens":100}'
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -m json.tool
+
+# 长输出测试（中文，应正确，~14 tok/s）
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -m json.tool
+
+# 代码测试（中文 prompt，应正确）
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -m json.tool
+
+# 英文测试（已知问题：可能出现垃圾 token）
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -m json.tool
 ```
+
+预期结果：
+
+| 测试 | 预期 | 实测速度 |
+|------|------|----------|
+| 中文短回复（2+2） | 正确 | 首次含 warmup ~17s，后续 <1s |
+| 中文长输出（万里长城） | 正确，finish_reason=stop | ~14 tok/s |
+| 中文代码（快速排序） | 正确，代码可运行 | ~14 tok/s |
+| 英文代码（quicksort） | 可能出垃圾 token | ~14 tok/s |
+
+中文全对 + 英文有问题 = 部署正确（jasl fork 已知限制）。
 
 ## 显存分配（双机 256GB）
 

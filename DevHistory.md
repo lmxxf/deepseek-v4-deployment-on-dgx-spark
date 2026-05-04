@@ -1041,8 +1041,20 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1”
   --enforce-eager
 ```
 
-### 待解决
+### 待解决：修复英文输出垃圾
 
-- 英文输出垃圾——等 jasl 继续覆盖残余 Marlin 路径，或等 vLLM 官方修复（issue #40928）
+jasl fork 中文完美但英文有残留问题。Consumer-DeepGEMM 验证时中英文都正确（底层 GEMM 全换了），说明 jasl 的 Triton 重写没有覆盖所有路径——某些残余路径仍 fallback 到 Marlin。
+
+**下一步排查计划：**
+
+1. **抓 kernel dispatch 日志**——用英文垃圾 prompt 和中文正常 prompt 各跑一次，对比 vLLM 日志里哪些 kernel 走了 Triton、哪些 fallback。jasl 代码里应该有路径选择日志
+2. **diff 中英文的 dispatch 路径**——找出英文触发了而中文没触发的那条残余路径
+3. **定位残余路径的具体代码位置**——在 jasl 的 `ds4-sm120` 分支里找到对应的 fallback 点
+4. **用 Triton 补上那条路径**——参考 jasl 已有的 Triton kernel 风格，补写缺失的那个
+
+入口：`docker exec vllm_node` 进容器，开 `VLLM_LOGGING_LEVEL=DEBUG` 或在 jasl 的 kernel dispatch 逻辑里加日志。重点关注 `fused_moe/` 和 `deepseek_v4.py` 里的 backend 选择分支。
+
+**其他待跟踪：**
 - vLLM 0.20.0/0.20.1 没有修复 sm_120+ MXFP4 MoE 问题
 - DeepGEMM 明确不打算支持 sm_120+
+- jasl PR #40991 何时合入主线
