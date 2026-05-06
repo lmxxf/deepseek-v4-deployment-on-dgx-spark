@@ -1343,3 +1343,33 @@ Consumer-DeepGEMM 输出正确（中英文均无垃圾），但速度只有 0.8 
 反量化的 BF16 是临时 tensor，用完即释放，峰值只多占 ~16MB。
 
 预估提速 10-20×，目标 5-10 tok/s。
+
+### 方案 1 实测结果（2026-05-06 下午）
+
+实现了 FP4 反量化 + cuBLAS 路径，完全绕开 CUTLASS grouped GEMM：
+- 只反量化被选中的 6 个专家（不是全部 256 个）
+- 每个专家用 `_dequant_fp4_block`（PyTorch 向量化 GPU 操作）+ `torch.mm`
+- 修复 `_dequant_fp8_block` 从 scale shape 推断 block_k
+
+```
+测试1 "2+2等于几"         →  14 tokens, stop ✅
+测试2 "请用500字介绍万里长城" → 454 tokens / 583s = ~0.78 tok/s ✅
+测试3 "What is quicksort?" → 500 tokens / 638s = ~0.78 tok/s ✅（干净英文）
+测试4 "写一个Python快排"    → 500 tokens / 635s = ~0.79 tok/s ✅
+```
+
+**正确性完美（中英文均无垃圾），但速度完全没变。**
+
+### 关键发现：瓶颈不在 MoE FP4 GEMM
+
+MoE GEMM 从 CUTLASS grouped launch（120 次/token）换成 FP4 反量化 + cuBLAS（12 次 torch.mm/token），速度 0.78 vs 0.79 tok/s——完全一样。
+
+**结论：~1.2s/token 的时间不是花在 MoE GEMM 上，而是花在 Consumer-DeepGEMM 提供的其他 Python fallback 函数上。** 候选热点：
+
+1. **`fp8_gemm_nt`** — FP8 普通 linear（非 MoE），每层多次调用，Python fallback 做 dequant + torch.mm
+2. **`fp8_einsum`** — MLA attention 的 einsum 操作
+3. **`tf32_hc_prenorm_gemm`** — hyperconnection prenorm
+4. **`get_paged_mqa_logits_metadata`** — MLA paged attention 的 metadata 计算（纯 Python prefix sum + binary search）
+5. **`fp8_fp4_paged_mqa_logits`** / **`fp8_fp4_mqa_logits`** — attention logits
+
+需要 profiling 定位真正的热点。
