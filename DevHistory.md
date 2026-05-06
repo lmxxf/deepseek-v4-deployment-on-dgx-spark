@@ -1269,3 +1269,77 @@ ptxas /tmp/tmpqq3oxlqq.ptx, line 4341; error: Feature '.tile::scatter4' not supp
 ### 改动已回滚
 
 设备检查的修改已 `git checkout -- .` 回滚，不合入。
+
+---
+
+## 第十一阶段：Consumer-DeepGEMM launch overhead 优化（2026-05-06）
+
+### 目标
+
+Consumer-DeepGEMM 输出正确（中英文均无垃圾），但速度只有 0.8 tok/s。分析瓶颈并优化。
+
+### 瓶颈分析
+
+**实际 MoE GEMM 参数**（decode 1 token, top_k=6）：
+- FC1: `[M_sum, 7168] × [256, 4096, 3584]` → `[M_sum, 4096]`
+- FC2: `[M_sum, 2048] × [256, 7168, 1024]` → `[M_sum, 7168]`
+- M_sum = 384（6 个专家各 64 行 padding，只有 6 行有效数据）
+- 每 token 调用 120 次 `m_grouped_fp8_fp4_gemm_nt_contiguous`（60 层 × 2 FC）
+
+**瓶颈不在计算，在 launch overhead**。每次 CUTLASS grouped GEMM 调用的固定开销：
+1. `segments_from_indices`：GPU→CPU 同步（384 个 int32 拷回 CPU）×120 次/token
+2. SFB reorder：256 个专家的 weight scale 每次重新做 SfAtom reorder ×120 次
+3. 13 次 `device_copy_from_host`：strides/layouts/pointer arrays CPU→GPU ×120 次
+4. CUTLASS `can_implement()` + `get_workspace_size()` + `initialize()` + `run()`：每次重新初始化
+5. workspace 每次重新分配
+
+每次 launch ~8ms × 120 = ~1s/token → 0.76 tok/s。计算本身（M=1-2 行/专家的微型 GEMM）几乎不花时间。
+
+### 优化改动（Phase 1）
+
+1. **SFB 缓存**：用 `static unordered_map<uintptr_t, SFBCacheEntry>` 按 `b_scale.data_ptr()` 做 key。第一次调用时对全部 256 个专家的 weight scale 做一次 SfAtom reorder 并缓存在 GPU 上，后续调用直接用 pointer 偏移。消灭 720 次/token GPU reorder kernel。
+
+2. **GPU segment 提取**：新增 `extract_segments_kernel`（单线程 GPU kernel）替代 CPU `segments_from_indices`。GPU→CPU 同步从拷贝 384 个 int32 降低到拷贝 ~19 个 int32（1 个 num_segments + 3×active 个 segment 元数据）。
+
+3. **Workspace 缓存**：`get_workspace()` 只增长不缩小，避免每次 malloc。
+
+4. **预分配 segment metadata buffer**：`seg_group/seg_start/seg_count/num_segments` 一次分配重复使用。
+
+5. **去掉 gather/scatter 路径**：vLLM contiguous layout 保证同一 group 行连续，不需要 gather 到临时 buffer。
+
+6. **只接受 per-row expert_ids 格式**：cumsum 格式回退到 Python fallback。
+
+### 测试结果
+
+```
+英文测试（cold cache）：
+"What is quicksort? Explain with code."
+→ 内容正确（无垃圾），但模型用中文回答了英文问题
+→ 500 tokens / 656s = ~0.76 tok/s
+```
+
+**速度基本无变化**（上次 0.77 tok/s）。SFB 缓存省掉的开销在总时间里占比太小。
+
+第二次测试（warm cache）：
+```
+"What is quicksort? Explain with code."
+→ 干净的英文输出 ✅（quicksort 解释 + Java 代码）
+→ 500 tokens / 637s = ~0.79 tok/s
+```
+
+第一次 cold start 用中文回答英文问题，第二次 warm cache 正常英文输出。cold start 时 SFB 缓存初始化（256 个专家的 weight scale 一次性 reorder）可能扰动了前几个 token 的路由。正确性无问题。
+
+### 瓶颈确认
+
+真正的时间杀手是 **120 次/token 的 CUTLASS `initialize()` + `run()` 调用**。每次 launch 的固定开销（构建 arguments、H2D pointer arrays、CUTLASS 初始化）~8ms，这个改不掉——是 CUTLASS grouped GEMM API 的设计决定的。
+
+### 下一步：方案 1 — FP4 反量化 + cuBLAS BF16 matmul
+
+绕开 CUTLASS grouped GEMM，改用：
+1. GPU kernel 把选中的 6 个专家 FP4 权重反量化为 BF16（~0.1ms/专家）
+2. `torch.mm` 做 BF16 matmul（cuBLAS 对小 M 优化好）
+3. 120 次 CUTLASS launch → 12 次 `torch.mm`（6 专家 × 2 FC）
+
+反量化的 BF16 是临时 tensor，用完即释放，峰值只多占 ~16MB。
+
+预估提速 10-20×，目标 5-10 tok/s。
