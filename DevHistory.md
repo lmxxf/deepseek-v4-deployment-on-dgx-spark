@@ -1041,6 +1041,25 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1”
   --enforce-eager
 ```
 
+### Consumer-DeepGEMM Profiling 更新（2026-05-06）
+
+重启后重新跑 profiling（间隔 10 次打印），200 字北京测试 prompt：
+
+```text
+稳态数据（~11000 calls 后收敛）：
+  m_grouped_fp8_fp4_gemm_nt_contiguous  avg = 13.8 ms/call（之前 31 ms → 快了 2.2 倍）
+  get_paged_mqa_logits_metadata         avg = 0.17 ms/call（忽略不计）
+
+比例：每生成 1 token 约 89 次 FP4 GEMM + 1 次 metadata
+总 GEMM 时间占比：~99.98%
+```
+
+对比之前（2026-05-03）：31ms/call → 现在 13.8ms/call。改善来自重启后 CUDA JIT cache 和 warmup 更完整。但仍然比 jasl fork（14 tok/s）慢一个数量级——瓶颈不在单次 kernel 速度，在 launch 次数（89 次/token × CPU↔GPU 同步）。
+
+Consumer-DeepGEMM 的价值确认为**根因验证工具**，不是性能方案。
+
+---
+
 ### 待解决：修复英文输出垃圾
 
 jasl fork 中文完美但英文有残留问题。Consumer-DeepGEMM 验证时中英文都正确（底层 GEMM 全换了），说明 jasl 的 Triton 重写没有覆盖所有路径——某些残余路径仍 fallback 到 Marlin。
