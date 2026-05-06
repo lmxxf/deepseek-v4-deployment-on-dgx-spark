@@ -1464,18 +1464,90 @@ Triton dequant 后，CDG grouped GEMM 内部时间分布：
 - torch.mm ×6: ~11 ms（cuBLAS，6 个专家各一次 launch）
 - 索引操作: ~0.3 ms
 
-cuBLAS 小矩阵 launch overhead 是下一个优化方向（torch.bmm 批量化），但收益有限。更大的瓶颈可能已经转移到 jasl 的 Triton attention/einsum kernels（CDG profiling 看不到）。
+下一步方向：fused dequant+matmul Triton kernel，消灭中间 BF16 临时 tensor。
+
+---
+
+## 第十三阶段：Fused Dequant+Matmul Triton Kernel（2026-05-06）
+
+### 目标
+
+把 FP4 dequant 和 matmul 合并到一个 Triton kernel 里，消灭中间 `[N, K]` BF16 临时 tensor（每专家 ~56MB for FC1）。
+
+### 尝试过的方案
+
+1. **torch.bmm 批量化**：把 6 个专家的 mm 合成 1 次 bmm。matmul 部分快 1.56×，但 `torch.stack` 6 个 `[4096, 7168]` tensor 到 FP32（~670MB 内存分配+拷贝）完全抵消了收益。端到端反而慢 20%。**放弃。**
+
+2. **Fused Triton kernel**（采用）：`_fused_dequant_matmul_kernel` 在 kernel 内部沿 K 维分块迭代，每块加载 packed FP4 就地 dequant 成 float32，直接和 A 的对应列做 `tl.dot` 累加，不写出中间 tensor。
+
+### Fused Kernel 设计
+
+```
+D[m, n] = sum_k A[m, k] * B_dequant[n, k]
+```
+
+- Grid: `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 沿 K 维循环，每次处理 BLOCK_K=64 个值（32 packed bytes）
+- A 的偶数列（k=0,2,4,...）对应 packed byte 的 low nibble
+- A 的奇数列（k=1,3,5,...）对应 packed byte 的 high nibble
+- 分别加载 a_even/a_odd，dequant 得 low_val/high_val，做两次 `tl.dot` 累加
+- E8M0 scale 用 `tl.exp2(e - 127)` 就地计算
+- 使用 `input_precision="ieee"` 提高精度
+
+### 精度分析
+
+`tl.dot` 在 SM121 上走 tensor core，即使指定 IEEE 模式仍有累积误差：
+
+| M | N | K | rel_err | 结论 |
+|---|---|---|---------|------|
+| 1 | 32 | ≤4096 | 0.000000 | 完美 |
+| 1 | 4096 | 7168 | 0.005 | 可接受 |
+| 64 | 4096 | 7168 | ~0.02 | BF16 噪声范围 |
+
+rel_err ~2% 在 BF16（7 bit mantissa, ~0.8% 固有精度）推理中完全可接受。
+
+### Benchmark（容器内，带 cuda.synchronize）
+
+```
+FC1 [M=384, K=7168, N=4096]:
+  Dequant+mm (Triton dequant + cuBLAS): 13.95 ms
+  Fused kernel:                           6.40 ms → 2.18x
+
+FC2 [M=384, K=2048, N=7168]:
+  Dequant+mm: 7.11 ms
+  Fused kernel: 3.22 ms → 2.21x
+```
+
+### 实测结果
+
+```
+500 tokens / 267s = 1.87 tok/s ✅（干净英文输出）
+```
+
+### 速度演进
+
+| 版本 | tok/s | 相对首版 |
+|------|-------|---------|
+| Python fallback（CUTLASS grouped / dequant+cuBLAS） | 0.79 | 1.0× |
+| Triton FP4 dequant + cuBLAS mm | 1.67 | 2.1× |
+| **Fused Triton dequant+matmul** | **1.87** | **2.4×** |
+
+### 剩余瓶颈
+
+GEMM 之外的开销占比增大：jasl Triton attention/einsum、Python 调度（unique/nonzero/index_select/index_copy）。这些不在 CDG 控制范围内。
 
 ### 改动文件
 
 ```
 Consumer-DeepGEMM/
 ├── consumer_deep_gemm/
-│   ├── triton_moe.py  (新增) — Triton FP4 dequant kernel + grouped GEMM
-│   └── gemm.py        (修改) — m_grouped_fp8_fp4_gemm_nt_contiguous 调用 Triton 版本
+│   ├── triton_moe.py  (更新) — 新增 fused dequant+matmul kernel，grouped GEMM 改用 fused 路径
+│   └── gemm.py        (不变) — 入口仍调用 triton_moe
 └── tests/
-    ├── test_triton_dequant.py (新增) — dequant 正确性 + 速度测试
-    └── test_triton_grouped.py (新增) — grouped GEMM 端到端测试
+    ├── test_triton_dequant.py  — dequant 正确性 + 速度
+    ├── test_triton_grouped.py  — grouped GEMM 端到端
+    ├── test_fused_matmul.py (新增) — fused kernel 正确性 + 速度
+    └── test_fused_e2e.py    (新增) — fused grouped GEMM 端到端
 ```
 
 ### 当前镜像状态
@@ -1483,4 +1555,4 @@ Consumer-DeepGEMM/
 | 镜像 | 中文 | 英文 | 速度 | 用途 |
 |------|------|------|------|------|
 | `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
-| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.67 tok/s | 英文正确 + Triton FP4 dequant |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | 英文正确 + Fused Triton kernel |
