@@ -1556,3 +1556,27 @@ Consumer-DeepGEMM/
 |------|------|------|------|------|
 | `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
 | `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | 英文正确 + Fused Triton kernel |
+
+---
+
+## 后续优化方向（待做）
+
+按投入产出排序：
+
+### 1. Python 调度开销优化（预估 10-20% 提速，中等难度）
+
+每次 grouped GEMM 调用有 `unique()` + 6× `nonzero()` + 6× `index_select` + 6× `index_copy_`。这些涉及 GPU→CPU 同步和小 kernel launch。优化方向：
+- 写 Triton kernel 把 gather/scatter fuse 掉
+- 缓存 row indices（连续 token 的 expert 分配变化不大）
+
+### 2. Fused kernel tile size 调优（预估 5-15%，低难度）
+
+当前 `BLOCK_M=64, BLOCK_N=32, BLOCK_K=64` 是手动选的。用 Triton `@triton.autotune` 搜索最优 tile size 可能有提升，尤其是 BLOCK_N 和 BLOCK_K 对 SM121 的 shared memory / register 使用有影响。
+
+### 3. FP8 activation dequant fuse（预估 <5%，中等难度）
+
+目前 FP8 dequant 走 Python `_dequant_fp8_block`（0.06ms/call），占比极小。Fuse 进 matmul kernel 省一次 BF16 中间 tensor 读写，但 M=384 时收益有限。
+
+### 4. jasl Triton attention/einsum（收益未知，不在 CDG 范围内）
+
+CDG profiling 只能看到 MoE GEMM（>99%），jasl 的 Triton kernels（attention、MLA、einsum、hyperconnection）不经过 CDG。如果 jasl 优化了这部分，整体速度还能上去——但那是 jasl fork 的工作。
