@@ -1580,3 +1580,32 @@ Consumer-DeepGEMM/
 ### 4. jasl Triton attention/einsum（收益未知，不在 CDG 范围内）
 
 CDG profiling 只能看到 MoE GEMM（>99%），jasl 的 Triton kernels（attention、MLA、einsum、hyperconnection）不经过 CDG。如果 jasl 优化了这部分，整体速度还能上去——但那是 jasl fork 的工作。
+
+---
+
+## 技术洞见备忘
+
+### SM120 FP4/FP8 指令支持状态
+
+| 格式 | SM100（数据中心卡） | SM120（消费级卡） |
+|------|-------------------|-----------------|
+| BF16 matmul | 完整 | 完整 |
+| FP8 matmul | 完整（tcgen05） | 残缺（部分指令缺失） |
+| FP4 matmul | 完整（tcgen05） | 不存在 |
+| TMA 硬件搬运 | 有 | 无 |
+
+SM120 上只有 BF16 矩阵乘法是完整可用的。FP4 反量化必须一路膨胀到 BF16 再算——不是我们想膨胀，是没得选。反量化到 FP8 理论上精度足够（FP4 只有 16 个值，FP8 有 256 个值可无损表示），但 SM120 的 FP8 matmul 也不完整。
+
+### DeepSeek V4 FP4 是 QAT（量化感知训练）
+
+DeepSeek V4 的 FP4 不是训练后量化（post-training quantization），而是训练时就模拟了 FP4 精度（Quantization-Aware Training）。模型训练过程中"看到"了 FP4 的量化误差，权重适应了这种误差。这意味着推理时的 FP4 反量化规则必须和训练时一致——否则模型"学会适应"的误差模式对不上。
+
+### DeepSeek V4 MoE 两阶段训练导致低容错性
+
+训练分两阶段：先独立训练 10+ 个领域专家（数学、代码、Agent、指令跟随等，各自做 SFT + RL），再通过 On-Policy Distillation 蒸馏到统一模型。256 个专家的权重是各自独立演化后再"拼"到一起的，彼此没有共享梯度历史，权重分布差异极大。
+
+MoE 稀疏激活（每 token 只用 6/256 个专家）意味着每个专家话语权极大——一个算错就没有其他专家纠偏。这解释了为什么 Marlin 在 SM120 上的"数据布局解释错误"（不是精度低，是算出垃圾）会导致英文输出全崩：踩到一个"误差被放大"的专家，60 层传播下来面目全非。
+
+### torch.bmm 批量化为什么失败
+
+6 次 torch.mm → 1 次 torch.bmm，matmul 部分快 1.56×。但 torch.stack 6 个 [4096, 7168] BF16 tensor 到 FP32 需要分配 ~670MB 连续显存并拷贝数据，这个 stack 开销比省下来的 matmul launch 开销还大。端到端反而慢 20%。教训：优化要看端到端。
