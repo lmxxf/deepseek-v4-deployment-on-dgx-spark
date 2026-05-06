@@ -1383,12 +1383,104 @@ Consumer-DeepGEMM 输出正确（中英文均无垃圾），但速度只有 0.8 
 
 MoE GEMM 从 CUTLASS grouped launch（120 次/token）换成 FP4 反量化 + cuBLAS（12 次 torch.mm/token），速度 0.78 vs 0.79 tok/s——完全一样。
 
-**结论：~1.2s/token 的时间不是花在 MoE GEMM 上，而是花在 Consumer-DeepGEMM 提供的其他 Python fallback 函数上。** 候选热点：
+**之前的结论 "瓶颈不在 MoE GEMM" 是错误的。** 换 dequant+cuBLAS 速度没变，是因为 Python `_dequant_fp4_block` 的临时 tensor 操作本身就是大头——换了 matmul 方式但 dequant 仍然慢。
 
-1. **`fp8_gemm_nt`** — FP8 普通 linear（非 MoE），每层多次调用，Python fallback 做 dequant + torch.mm
-2. **`fp8_einsum`** — MLA attention 的 einsum 操作
-3. **`tf32_hc_prenorm_gemm`** — hyperconnection prenorm
-4. **`get_paged_mqa_logits_metadata`** — MLA paged attention 的 metadata 计算（纯 Python prefix sum + binary search）
-5. **`fp8_fp4_paged_mqa_logits`** / **`fp8_fp4_mqa_logits`** — attention logits
+Profiling 确认：**只有 `m_grouped_fp8_fp4_gemm_nt_contiguous` 和 `get_paged_mqa_logits_metadata` 经过 CDG**，其他函数（attention/einsum/hyperconnection）全被 jasl 的 Triton kernels 接管，不走 CDG。MoE grouped GEMM 占 CDG 调用时间的 >99%。
 
-需要 profiling 定位真正的热点。
+---
+
+## 第十二阶段：Triton FP4 Dequant Kernel（2026-05-06）
+
+### 目标
+
+用 Triton kernel 替换 Python `_dequant_fp4_block`，消灭 FP4 反量化步骤的大量临时 tensor 操作。
+
+### Triton FP4 E2M1 Dequant Kernel
+
+新增 `consumer_deep_gemm/triton_moe.py`，核心是 `_dequant_fp4_e2m1_kernel`：
+
+- 输入：`[N, K/2] uint8`（packed E2M1）+ `[N, K/32] uint8`（E8M0 scales）
+- 输出：`[N, K] bf16`
+- 硬编码 E2M1 lookup（避免 table load），E8M0 用 `tl.exp2(e - 127)` 直接算
+- 一个 kernel 完成解包 + scale 乘法 + interleave 写出
+- 不使用 `.tile::scatter4` / TMA / tcgen05，SM120/SM121 全兼容
+
+### 单元测试
+
+```
+FP4 dequant [4096, 3584]: max_diff=0.000000 ✅
+各形状测试:
+  [    1,    64]: max_diff=0.000000 PASS
+  [   64,   128]: max_diff=0.000000 PASS
+  [ 4096,  7168]: max_diff=0.000000 PASS
+  [ 2048,  4096]: max_diff=0.000000 PASS
+
+FP4 dequant 速度:
+  Python:  3.45 ms
+  Triton:  0.22 ms
+  Speedup: 15.4x
+```
+
+### Grouped GEMM 端到端测试
+
+```
+Grouped GEMM Correctness: max_diff=0.000000 ✅
+
+FC1 [M=384, K=7168, N=4096]:
+  Python:  52.59 ms → Triton: 14.00 ms → 3.8x
+FC2 [M=384, K=2048, N=7168]:
+  Python:  26.62 ms → Triton:  6.98 ms → 3.8x
+
+Step Breakdown (Triton path):
+  FP8 dequant:      0.06 ms（Python fallback，M 小不值得优化）
+  Index ops:         0.22 ms
+  FP4 dequant ×6:   2.85 ms（Triton kernel）
+  Full (dequant+mm): 14.50 ms（torch.mm 占剩余 ~11 ms）
+```
+
+### 接入与实测
+
+修改 `gemm.py` 的 `m_grouped_fp8_fp4_gemm_nt_contiguous`，改为调用 Triton 版本。
+
+重建镜像，关闭 profiling sync（`CDG_PROFILE=0`）实测：
+
+```
+500 tokens / 300s = 1.67 tok/s ✅（干净英文输出）
+```
+
+**对比：0.79 tok/s → 1.67 tok/s，2.1× 提速。**
+
+### Profiling 对比（开 CDG_PROFILE=1，带 cuda.synchronize）
+
+| 版本 | avg ms/call | 备注 |
+|------|-------------|------|
+| Python fallback（旧） | 14.00 ms | `_dequant_fp4_block` 大量临时 tensor |
+| Triton dequant（新） | 6.89 ms | dequant 快 15×，torch.mm 仍占大头 |
+
+### 剩余瓶颈分析
+
+Triton dequant 后，CDG grouped GEMM 内部时间分布：
+- FP4 dequant: ~2.85 ms（已优化）
+- torch.mm ×6: ~11 ms（cuBLAS，6 个专家各一次 launch）
+- 索引操作: ~0.3 ms
+
+cuBLAS 小矩阵 launch overhead 是下一个优化方向（torch.bmm 批量化），但收益有限。更大的瓶颈可能已经转移到 jasl 的 Triton attention/einsum kernels（CDG profiling 看不到）。
+
+### 改动文件
+
+```
+Consumer-DeepGEMM/
+├── consumer_deep_gemm/
+│   ├── triton_moe.py  (新增) — Triton FP4 dequant kernel + grouped GEMM
+│   └── gemm.py        (修改) — m_grouped_fp8_fp4_gemm_nt_contiguous 调用 Triton 版本
+└── tests/
+    ├── test_triton_dequant.py (新增) — dequant 正确性 + 速度测试
+    └── test_triton_grouped.py (新增) — grouped GEMM 端到端测试
+```
+
+### 当前镜像状态
+
+| 镜像 | 中文 | 英文 | 速度 | 用途 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.67 tok/s | 英文正确 + Triton FP4 dequant |
