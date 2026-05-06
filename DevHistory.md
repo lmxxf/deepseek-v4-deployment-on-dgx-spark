@@ -1205,3 +1205,67 @@ spark-vllm-docker/
 ├── qutlass-src/                 # qutlass（checkout 830d2c4）
 └── flashmla-src/                # FlashMLA（checkout a6ec2ba）
 ```
+
+---
+
+## 第十阶段：尝试用 Triton 替换 Marlin FP4 MoE（2026-05-06，失败）
+
+### 目标
+
+分析 jasl fork 中英文垃圾的根因，尝试用 Triton MoE backend 替代 Marlin，修复英文输出。
+
+### 关键发现：jasl 替换的不是 MoE FP4 GEMM
+
+通过分析代码结构，发现了一个重要的认知修正：
+
+**jasl 的 Triton 重写覆盖的是 attention/MLA 路径（sparse MLA、paged MQA、FP8 einsum、hyperconnection），不是 FP4 MoE GEMM 路径。**
+
+FP4 MoE GEMM 一直走的是 Marlin，jasl 从来没动过这条路。中文能用不是因为 jasl 替换了 MoE kernel，而是中文激活的专家组合恰好没踩 Marlin 在 SM120 上的 bug。
+
+证据链：
+1. vLLM 启动日志：`Using 'MARLIN' Mxfp4 MoE backend` —— 即使用 jasl fork，MoE backend 仍然选的 Marlin
+2. jasl 的 `deepseek_v4_triton_kernels.py` 内容全是 attention 相关（paged MQA、FP8 KV cache 操作），没有 MoE GEMM
+3. oracle `_get_priority_backends()` 里 TRITON_UNFUSED 被注释掉了（"has bug with MTP support"），优先级列表 TRTLLM → DEEPGEMM → MARLIN，SM120 上前两个都不支持，直接 fallback 到 Marlin
+
+### 尝试 1：`--moe-backend triton`
+
+强制走 Triton MoE backend。
+
+**结果**：`kernel does not support current device cuda`
+
+原因：`gpt_oss_triton_kernels_moe.py` 的 `_supports_current_device()` 检查 `(9, 0) <= (cap.major, cap.minor) < (11, 0)`，SM121 = (12, 1) 不在范围内。
+
+### 尝试 2：修改设备检查上限 + 取消注释 TRITON_UNFUSED
+
+用 `sed` patch 容器内文件（不重新编译）：
+- `gpt_oss_triton_kernels_moe.py`：设备检查 `(11, 0)` → `(13, 0)`（两处）
+- `oracle/mxfp4.py`：设备检查 `(11, 0)` → `(13, 0)` + TRITON_UNFUSED 取消注释
+
+**结果**：Triton PTX codegen error
+
+```
+ptxas /tmp/tmpqq3oxlqq.ptx, line 4341; error: Feature '.tile::scatter4' not supported on .target 'sm_121a'
+```
+
+**根因**：Triton 标准库的 FP4 MoE kernel（`_p_matmul_ogs` from `triton_kernels`）在编译时生成了 SM100 专属的 `.tile::scatter4` PTX 指令。这个指令在 SM121 上物理不存在——不是软件限制，是硬件不支持。
+
+所以设备检查 `(11, 0)` 上限不是"保守"，是**正确的**——Triton 编译器确实会给 SM120 生成不支持的指令。改了检查也没用。
+
+### 结论
+
+**SM120 上目前没有可用的 FP4 MoE GEMM 替代方案：**
+
+| 方案 | 状态 | 原因 |
+|------|------|------|
+| Marlin FP4 | 能跑但算错 | SM120 的 FP4 MMA 行为差异 |
+| CUTLASS MXFP4（vLLM 内置） | 拒绝 SM120 | 依赖 TMA + tcgen05 |
+| Triton 标准 FP4 MoE | SM120 上编译失败 | 生成 `.tile::scatter4` 指令，SM121 不支持 |
+| Consumer-DeepGEMM | 正确但 0.8 tok/s | CUTLASS SM120 模板，launch overhead 太大 |
+
+**jasl 的贡献**是修了 attention/MLA 路径（没有 jasl 的话连中文都跑不起来），但 FP4 MoE 这条路他没碰——也没法碰，因为没有 SM120 兼容的 FP4 MoE kernel 可用。
+
+**真正的修复方向**：写一个不使用 `.tile::scatter4` / TMA / tcgen05 的 SM120 兼容 Triton FP4 MoE kernel。这是一个独立项目级别的工作——Consumer-DeepGEMM 的 CUTLASS 版本证明了方向正确（输出正确），但需要 Triton 版本来获得实用速度（消除 launch overhead）。
+
+### 改动已回滚
+
+设备检查的修改已 `git checkout -- .` 回滚，不合入。
