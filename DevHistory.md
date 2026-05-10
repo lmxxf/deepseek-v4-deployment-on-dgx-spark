@@ -2037,17 +2037,58 @@ sm_121 实际行为（线性顺序）：
 
 **结论**：修复不能简单加 shfl——需要搞清楚 Marlin 的 smem swizzle pattern，然后在 swizzle 后的布局上做正确的 ldmatrix 补偿。这是一个更复杂的问题。
 
-### CMakeLists.txt sm_120 native 编译保留
+### shfl fix 在 PTX JIT 模式下也失败（无条件 shfl，sm_80 PTX）
 
-`MARLIN_MOE_ARCHS "8.0+PTX;12.0;12.1"` 保留——即使 shfl fix 还没搞定，sm_120 native 编译比 PTX JIT 更可控，也为后续修复提供基础。
+回退 sm_120 native 编译（恢复 `MARLIN_MOE_ARCHS "8.0+PTX"`），直接无条件 shfl。结果：**也是完全空白**。
 
-### 下一步方向
+**结论：shfl fix 方向错误。** 不管 native 还是 PTX JIT，加 shfl 都让输出崩溃。我们的 ldmatrix 测试可能有 bug，或者 ldmatrix 行为差异不是 Marlin 乱码的原因——Marlin 的 sm_80 PTX JIT + sm_121 ldmatrix 的组合是"部分工作"的状态，shfl 打破了这个部分补偿。
 
-1. **搞清楚 Marlin 的 smem swizzle pattern**——在 Marlin kernel 内部 dump 实际的共享内存布局，然后用这个真实布局重做 ldmatrix 行为测试
-2. ~~直接 shfl fix~~（连续布局验证通过，但 swizzle 布局下失败）
-3. ~~christopherowen CUTLASS 路径~~（CUTLASS 版本不兼容，暂搁）
-4. **查 CDG shim 层拦截了哪些不该拦截的路径**——jasl 14 vs CDG 2.2 的 6.4x 差距
-5. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 codegen（issue #7550）
+### 关键发现：`__CUDA_ARCH__ < 890` 的 FP8 guard（第 296-298 行）
+
+```cpp
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
+#endif
+```
+
+sm_80 PTX 编译时 `__CUDA_ARCH__` = 800 < 890 → FP8 activation 的 kernel 直接 return。V4 Flash 的 activation 实际是 **BF16**（`get_marlin_input_dtype()` 默认返回 None，不做 FP8 量化），走 BF16 mma 路径。sm_120 native 编译时 `__CUDA_ARCH__` = 1200 > 890，FP8 路径被启用——但其他代码没适配，导致全崩。
+
+### oracle 内部路径分析（2026-05-10）
+
+在 jasl fork 内部强制 oracle 选 `DEEPGEMM_MXFP4` backend（修改 `mxfp4.py` 的两个 `select` 函数），安装 Consumer-DeepGEMM。结果：
+
+- **英文完美，零垃圾** ✅（验证 Marlin 确实是乱码根因）
+- **速度 2.1 tok/s**（和之前 CDG 镜像一样）
+
+**`DeepGemmFP4Experts.apply()` vs Marlin `_fused_marlin_moe` 路径对比**：
+
+| 步骤 | Marlin (14 tok/s) | DeepGemmFP4Experts (2.1 tok/s) | 差异 |
+|------|-------------------|-------------------------------|------|
+| Permute | `sorted_token_ids` 由 vLLM 框架生成 | `deepgemm_moe_permute`（含 FP8 activation 量化） | CDG 多了 per-token FP8 quantize |
+| FC1 GEMM | `ops.moe_wna16_marlin_gemm` 1 次 fused C++ kernel | `m_grouped_fp8_fp4_gemm_nt_contiguous` Python 循环 6× dot_scaled | CDG: Python 循环 + 6 次 Triton launch |
+| Activation | `apply_moe_activation` | `_act_mul_quant`（SwiGLU + FP8 requantize） | CDG 多了 FP8 requantize |
+| FC2 GEMM | `ops.moe_wna16_marlin_gemm` 1 次 fused C++ kernel | `m_grouped_fp8_fp4_gemm_nt_contiguous` Python 循环 6× dot_scaled | 同上 |
+| Unpermute | Marlin kernel 内部完成 | `deepgemm_unpermute_and_reduce` | CDG 额外一步 |
+
+**速度差距来源**：
+1. **GEMM 调用方式**：Marlin 1 次 fused kernel 处理全部 expert，CDG Python 循环 6 次——这是主要差距
+2. **FP8 量化/反量化**：CDG 先 quantize activation 到 FP8（`deepgemm_moe_permute`），dot_scaled 内部又 cast 回来——做了无用功
+3. **额外步骤**：permute/unpermute 在 CDG 路径是独立 Python 调用，Marlin 融合在 kernel 里
+
+### 优化方向
+
+1. **写 fused CDG kernel**——把 permute + 6× dot_scaled + activation + unpermute 合成一个 Triton kernel，消灭 Python 循环
+2. **去掉不必要的 FP8 量化**——`deepgemm_moe_permute` 做了 per-token FP8 量化，但 dot_scaled 接受 BF16 input（内部再 cast）。直接传 BF16，省掉量化+反量化
+3. **直接修 Marlin**——仍然是终极方案，但 ldmatrix 行为差异的修复比想象复杂
+4. **等 Triton 修 SM120 native FP4 codegen**——`tl.dot_scaled` 从 bf16 emulation 升级到 native FP4 MMA
+
+### 当前可用镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 备注 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | Marlin MoE，英文乱码 |
+| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.2 tok/s | CDG shim 外挂 |
+| `vllm-node-jasl-fix:latest` | ✅ | ✅ | 2.1 tok/s | oracle 强制 DEEPGEMM + CDG |
 
 ### 改动文件
 
@@ -2064,9 +2105,48 @@ Consumer-DeepGEMM/
 
 ### 当前镜像
 
-| 镜像 | 中文 | 英文 | 速度 | 用途 |
+### 去掉 FP8 量化/反量化无用功（2026-05-10 晚）
+
+**发现**：`DeepGemmFP4Experts.apply()` 的流程中存在 BF16→FP8→BF16 的无用转换：
+1. prepare 阶段：BF16 activation → FP8 量化（`per_token_group_quant_fp8`）
+2. CDG 内部：FP8 → dequant 回 BF16（`_dequant_fp8_block`）
+3. dot_scaled 内部：BF16 → cast 回 FP8
+
+**修复**：
+- `DeepGemmFP4Experts` 加 `expects_unquantized_inputs = True`——prepare 跳过 FP8 量化
+- apply 里 activation 保持 BF16 直传 CDG
+- `deepgemm_moe_permute` 需要 scale tensor——传 dummy `torch.ones` scale（permute 只做行排序，scale 值不影响排序结果）
+- SwiGLU 后不做 FP8 requant，保持 BF16
+
+**结果**：
+
+```
+英文 "What is quicksort?": 500 tokens / 121s = 4.1 tok/s ✅ 零垃圾
+```
+
+**速度演进**：
+
+| 版本 | tok/s | 相对首版 |
+|------|-------|---------|
+| Python fallback + CUTLASS | 0.79 | 1.0x |
+| Fused dequant+matmul（float32） | 1.87 | 2.4x |
+| CDG dot_scaled（外挂 shim） | 2.11 | 2.7x |
+| CDG oracle 强制（有 FP8 无用功） | 2.1 | 2.7x |
+| **CDG 去掉 FP8 无用功** | **4.1** | **5.2x** |
+| jasl Marlin（有乱码） | 14 | 17.7x |
+
+**去掉 FP8 round-trip 直接翻倍（2.1→4.1）。** 剩余差距（4.1 vs 14 = 3.4x）在 Python 循环 6 次 dot_scaled kernel launch + permute/unpermute 额外步骤。
+
+### 当前镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 备注 |
 |------|------|------|------|------|
-| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
-| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | Fused float32 基线 |
-| `vllm-node-sm121-cdg:fp8` | ✅ | ✅ | 2.0 tok/s | FP8 tensor core |
-| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.11 tok/s | dot_scaled + 调度优化 |
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | Marlin MoE，英文乱码 |
+| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.2 tok/s | CDG shim 外挂 |
+| **`vllm-node-jasl-fix:latest`** | **✅** | **✅** | **4.1 tok/s** | **oracle 强制 DEEPGEMM + 去 FP8 无用功** |
+
+### 下一步优化方向
+
+1. **减少 Python 循环**——把 6 次 dot_scaled kernel launch 合成 1 次 grouped kernel
+2. **简化 permute**——当前走 `deepgemm_moe_permute`（含 `ep_scatter` CUDA kernel + dummy scale），可以换成更轻量的 `moe_align_block_size`
+3. **SwiGLU 融合**——`_act_mul_quant` 换成不做 FP8 requant 的版本，省一步
