@@ -2014,13 +2014,40 @@ sm_121 实际行为（线性顺序）：
 
 方向 1 最干净——只需要改共享内存的写入 pattern，不动 mma 和 dequant 逻辑。需要推导 sm_121 `ldmatrix` 的完整映射公式，然后生成对应的 permutation 表。
 
+### shfl fix 尝试（失败，2026-05-10 下午）
+
+**问题 1：sm_80 PTX JIT 导致 fix 被跳过**
+
+最初的 fix 用 `#if __CUDA_ARCH__ >= 1200`，但 Marlin MoE 编译为 `8.0+PTX`（CMakeLists.txt 第 1084 行 `MARLIN_MOE_ARCHS "8.0+PTX"`），JIT 到 sm_121 时 `__CUDA_ARCH__` = 800，条件不命中。
+
+**解法**：CMakeLists.txt 加 `12.0;12.1` 到 `MARLIN_MOE_ARCHS`，让 Marlin MoE 也编译 sm_120 native cubin。验证：`cuobjdump -lelf _moe_C.abi3.so` 显示 27 个 `sm_120.cubin`。
+
+**问题 2：shfl fix 正向/反向都让输出更差**
+
+| 版本 | 英文输出 |
+|------|---------|
+| jasl 原版（sm_80 PTX JIT） | 开头垃圾，后半自救 |
+| shfl fix 正向 `(laneid%8)*4 + laneid/8` | **完全空白** |
+| shfl fix 反向 `(laneid%4)*8 + laneid//4` | **完全空白** |
+| fix 回退（sm_120 native 但无 shfl） | 恢复"开头垃圾后自救" |
+
+**分析**：ldmatrix 在 sm_121 上的行为差异（测试验证了 128/128）是真的，但 Marlin 的共享内存有 **swizzle pattern**（防 bank conflict），不是简单的连续布局。我们的 ldmatrix 测试用的是 `smem[i] = i`（连续），但 Marlin 实际的 smem 布局经过了 swizzle。shfl fix 在连续布局上验证正确，但在 swizzle 后的布局上反而打乱了数据。
+
+**更深层的问题**：sm_80 PTX JIT 到 sm_121 时，ldmatrix 行为变了，但 `gptq_marlin_repack`（权重预处理，也是按 sm_80 假设做的）的 swizzle 排列**恰好部分补偿了** ldmatrix 的变化——不是完美补偿（否则英文也对），但够用到中文能跑、英文能自救。shfl fix 打破了这个"凑巧的补偿"。
+
+**结论**：修复不能简单加 shfl——需要搞清楚 Marlin 的 smem swizzle pattern，然后在 swizzle 后的布局上做正确的 ldmatrix 补偿。这是一个更复杂的问题。
+
+### CMakeLists.txt sm_120 native 编译保留
+
+`MARLIN_MOE_ARCHS "8.0+PTX;12.0;12.1"` 保留——即使 shfl fix 还没搞定，sm_120 native 编译比 PTX JIT 更可控，也为后续修复提供基础。
+
 ### 下一步方向
 
-1. **修 Marlin 的 sm_120 共享内存 permutation**——根因已确认是 `ldmatrix` 行为差异，修复 = 改共享内存写入 pattern。如果修成功 = 直接在 jasl 14 tok/s 基础上修复英文，一步到位 🎯
-2. ~~christopherowen CUTLASS 路径~~（CUTLASS 版本不兼容，暂搁）
-3. **查 CDG shim 层拦截了哪些不该拦截的路径**——jasl 14 vs CDG 2.2 的 6.4x 差距
-4. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 codegen（issue #7550）
-5. **升级 CUTLASS 到 v4.4.2**：如果做了，christopherowen 的 patch 就能直接用
+1. **搞清楚 Marlin 的 smem swizzle pattern**——在 Marlin kernel 内部 dump 实际的共享内存布局，然后用这个真实布局重做 ldmatrix 行为测试
+2. ~~直接 shfl fix~~（连续布局验证通过，但 swizzle 布局下失败）
+3. ~~christopherowen CUTLASS 路径~~（CUTLASS 版本不兼容，暂搁）
+4. **查 CDG shim 层拦截了哪些不该拦截的路径**——jasl 14 vs CDG 2.2 的 6.4x 差距
+5. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 codegen（issue #7550）
 
 ### 改动文件
 
