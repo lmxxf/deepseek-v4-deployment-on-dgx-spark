@@ -1973,12 +1973,53 @@ tile 改回 128×128，CUTLASS patch 全部回退。
 
 **另一个方向**：不修 Marlin，而是在 jasl fork 里把 MoE backend 从 Marlin 换成 CDG 的 `dot_scaled` 路径——保持 jasl 的 14 tok/s attention/MLA 路径，只替换 MoE GEMM。但需要解决 CDG shim 层拦截过多路径的问题。
 
+### 🔥 Marlin sm_120 bug 根因确认：ldmatrix 行为差异（2026-05-10）
+
+**逐层排除**：
+1. ✅ FP4 E2M1 → FP8 E4M3 dequant（bit manipulation 正确，架构无关）
+2. ✅ E8M0 scale dequant（sm_121 上测试通过，V4 真实 scale 范围 119-122 全 OK）
+3. ✅ FP8 `mma.sync.aligned.m16n8k32` fragment layout（PTX ISA 文档确认 sm_89+ 通用）
+4. ✅ FP4 `mma.sync.aligned.m16n8k64` fragment layout（PTX ISA 文档确认，和 sm_80 的 u4/s4 同族）
+5. ❌ **`ldmatrix.sync.aligned.m8n8.x4.shared.b16` 在 sm_121 上的行为和 sm_80/sm_90 不同！**
+
+**实验验证**（`test_ldmatrix_sm121.cu`）：
+
+共享内存填 `smem[i] = i`（0-255），用 `ldmatrix.sync.aligned.m8n8.x4.shared.b16` 加载，dump 每个线程拿到的值：
+
+```
+sm_80/sm_90 预期行为（行列交错分组）：
+  Thread 0: frag[0] = [0, 1]     （row 0, cols 0-1）
+  Thread 1: frag[0] = [8, 9]     （row 1, cols 0-1）
+  Thread 8: frag[0] = [2, 3]     （row 0, cols 2-3）
+  ...
+  → ldmatrix 做行列重排，把 8x8 矩阵按 tensor core fragment layout 分配到线程
+
+sm_121 实际行为（线性顺序）：
+  Thread 0: frag[0] = [0, 1]
+  Thread 1: frag[0] = [2, 3]
+  Thread 2: frag[0] = [4, 5]
+  ...
+  Thread 31: frag[0] = [62, 63]
+  → ldmatrix 不做重排，每个线程按 lane ID 顺序拿连续的 2 个 uint16
+```
+
+**31/32 个线程的 frag[0] 和预期不同**（只有 T0 和 T31 碰巧对齐）。
+
+**根因解释**：Marlin 假设 `ldmatrix` 会做 sm_80/90 风格的行列交错重排，按那个假设在共享内存里排列权重数据。但 sm_121 的 `ldmatrix` 不做那个重排——数据按线性顺序进寄存器。结果：mma 指令拿到的 fragment 里，矩阵元素位置全错了。不是"精度低"，是**矩阵的行列被彻底打乱**——解释了为什么输出是垃圾而不是"稍有偏差"。
+
+**修复方向**：
+1. **在 Marlin 的共享内存写入端做逆变换**——按 sm_121 的 ldmatrix 行为（线性）重新排列共享内存里的数据，让 ldmatrix 加载后的寄存器内容和 sm_80/90 的结果一致
+2. **或者在 Marlin 的寄存器端做后处理**——ldmatrix 加载后用 shuffle 指令重排寄存器
+3. **或者绕过 ldmatrix**——用普通的 `ld.shared` 加载 + 手动分配到寄存器（性能可能差）
+
+方向 1 最干净——只需要改共享内存的写入 pattern，不动 mma 和 dequant 逻辑。需要推导 sm_121 `ldmatrix` 的完整映射公式，然后生成对应的 permutation 表。
+
 ### 下一步方向
 
-1. ~~christopherowen CUTLASS 路径~~（CUTLASS 版本不兼容，暂搁）
-2. **修 Marlin 的 sm_120 fragment layout**——需要实验确认 sm_120 的 FP4 mma 寄存器映射，修改 permutation 表。如果修成功 = 直接在 jasl 14 tok/s 基础上修复英文，一步到位
-3. **查 CDG shim 层拦截了哪些不该拦截的路径**——jasl 14 vs CDG 2.2 的 6.4x 差距不在 MoE kernel，在 CDG 的 `deep_gemm` shim 可能接管了本该走 jasl Triton 的其他函数
-4. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 codegen（issue #7550），从 bf16 emulation 升级到 native FP4 MMA
+1. **修 Marlin 的 sm_120 共享内存 permutation**——根因已确认是 `ldmatrix` 行为差异，修复 = 改共享内存写入 pattern。如果修成功 = 直接在 jasl 14 tok/s 基础上修复英文，一步到位 🎯
+2. ~~christopherowen CUTLASS 路径~~（CUTLASS 版本不兼容，暂搁）
+3. **查 CDG shim 层拦截了哪些不该拦截的路径**——jasl 14 vs CDG 2.2 的 6.4x 差距
+4. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 codegen（issue #7550）
 5. **升级 CUTLASS 到 v4.4.2**：如果做了，christopherowen 的 patch 就能直接用
 
 ### 改动文件
