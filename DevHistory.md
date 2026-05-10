@@ -2172,9 +2172,42 @@ BF16 input path (no FP8 round-trip):
 
 如果 6 次合 1 次：1.431 - 1.174 + 0.151 = 0.408 ms → 理论 20.4 tok/s。但 grouped kernel 实测反而更慢。
 
-### 下一步优化方向
+### 6× kernel 并发实验（2026-05-10 深夜）
 
-1. **修复 grouped kernel 的性能**——避免 max_M padding 空跑，优化 metadata 传递
-2. **修复跳过冗余 sort**——搞清楚 `deepgemm_moe_permute` 的 padding layout 再重试
-3. **等 Triton 修 SM120 native FP4 codegen**（issue #7550）——dot_scaled 从 bf16 emulation 升级到 native MMA，kernel 本身再快几倍
-4. **修 Marlin 的 sm_120 bug**——终极方案，直接 14 tok/s + 英文正确
+**发现：6 次 kernel 在单 stream 上是串行的**
+
+```
+test_grouped_vs_loop.py:
+  1x kernel (baseline):     GPU 0.163ms
+  6x loop (wrapper):        GPU 1.145ms  Wall 1.126ms  Py OH ≈ 0
+  6x loop (direct kernel):  GPU 1.117ms  Wall 1.124ms  Py OH ≈ 0
+
+  6x GPU / 1x GPU = 7.02x  (ideal=6.0, >6 = GPU串行确认)
+  Direct vs Wrapper overhead: 0.002ms  (Python包装层不是瓶颈)
+```
+
+**Python 开销几乎为零。** 瓶颈不在 Python 循环——是同一个 CUDA stream 上的 kernel 必须顺序执行。
+
+**多 stream 实验：独立 benchmark 有效，vLLM 端到端无提升**
+
+```
+test_multistream.py:
+  6x single stream:          GPU 1.111ms
+  6x multi stream (6 streams): GPU 0.866ms (0.78x, 并发有效)
+  1x kernel (ideal):          GPU 0.164ms
+
+  Per token (×120):
+    Single stream: 133ms = 7.5 tok/s
+    Multi stream:  104ms = 9.6 tok/s
+```
+
+独立 benchmark 提速 22%（1.111→0.866ms）。但接入 vLLM 端到端实测仍然 4.2 tok/s——和单 stream 一样。原因：vLLM 服务中 GPU 已被 attention/MLA 等其他 kernel 占满，多 stream 的 MoE kernel 争不到额外的 SM 资源。
+
+**结论：4.2 tok/s 是当前架构天花板。** 瓶颈在 `dot_scaled` 的 bf16 emulation（Triton issue #7550，不是 native FP4 MMA）+ 单 SM GPU（DGX Spark GB10 只有 20 个 SM）。
+
+### 下一步方向
+
+1. **等 Triton 修 SM120 native FP4 codegen**（issue #7550）——dot_scaled 从 bf16 emulation 升级到 native FP4 MMA，kernel 本身再快几倍
+2. **修 Marlin 的 sm_120 bug**——终极方案，直接 14 tok/s + 英文正确。根因已定位到 ldmatrix 行为差异，但修复需要理解 Marlin 完整的 smem swizzle pattern
+3. **升级 CUTLASS 到 v4.4.2**——christopherowen 的 64×128 tile patch 可用
+4. **写 C++ dispatch 循环**——把 6 次 Triton kernel launch 的 Python 循环搬到 C++ 里，消除 Python→Triton→CUDA 的调用链开销（虽然 profiling 显示 Python OH ≈ 0，但每次 Triton JIT dispatch 有固定开销）
