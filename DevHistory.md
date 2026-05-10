@@ -1812,3 +1812,128 @@ SM12x **有** FP4 tensor core（基础 MMA 指令），没有的是 tcgen05 和 
 | `vllm-node-jasl-cofi:latest` | ✅ | ❌ | 14 tok/s | 混合实验，效果同 jasl |
 
 另外还搜到 NVIDIA 论坛上有人发了**单机 GB10 跑 V4 Flash MXFP4 的自定义 C++ runtime**，余弦相似度 0.9994-0.9999，已发布 v0.1.0 prerelease。decode bandwidth-bound。
+
+---
+
+## 第十四阶段：FP8/FP4 Tensor Core + dot_scaled 优化（2026-05-10）
+
+### 背景
+
+182 期公众号勘误过程中发现 sm_121 的 INT8/FP8/FP4 tensor core mma 指令全部完整存在（PTX ISA 9.2 确认）。之前"FP4 硬件不存在""FP8 残废"是错误归因——把 tcgen05 路径不可用推广成了整个 FP4/FP8 不可用。
+
+### 验证过程
+
+#### 1. INT8 tensor core（已有，NLA 项目验证）
+
+`tl.dot(int8, int8)` max_diff=0.0。详见 NLA 项目 `int8_linear.py`。
+
+#### 2. FP8 tensor core（新验证）
+
+```
+test_fp8_dot.py: tl.dot(float8e4nv, float8e4nv) max_diff=0.0 ✅
+```
+
+sm_121 上 FP8 mma 从 sm_89 就支持，完全没问题。
+
+#### 3. FP4→FP8 fused kernel
+
+把 `_fused_dequant_matmul_kernel` 里的 FP4→float32→`tl.dot(f32,f32)` 换成 FP4→FP8（无损）→`tl.dot(fp8,fp8)`。
+
+- E2M1→FP8 E4M3 转换用算术拼 bit：`(sign<<7)|(e<<3)|m`，16 个值全部无损映射
+- even/odd concat 到 K=32 满足 `tl.dot` 最小要求
+- 按 scale block 粒度迭代，E8M0 scale 精确无近似
+
+```
+Correctness: rel_err=2.77% (BF16 精度范围内)
+Speed: FC1 5.16ms→3.64ms (1.43x), FC2 2.58ms→1.79ms (1.44x)
+端到端 V4 Flash: 1.87→2.0 tok/s（kernel 快了但瓶颈在 Python 调度）
+```
+
+#### 4. tl.dot_scaled（关键发现）
+
+Triton 3.6 有 `tl.dot_scaled` API，原生支持 MXFP4 格式——`lhs_format="e4m3", rhs_format="e2m1"`。
+
+- 不需要手动 dequant、不需要拆 even/odd、不需要拼 FP8
+- Triton 内部一步到位：FP4 解包 + scale 应用 + matmul
+- SM120 上 fallback 到 bf16 emulation（Triton issue #7550），不是 native FP4 MMA，但结果完全正确
+
+```
+test_dot_scaled.py: dot_scaled e2m1×e2m1 max_diff=0.0000 ✅（零误差！）
+test_dot_scaled_mixed.py: dot_scaled e4m3×e2m1 编译运行成功 ✅
+
+Speed benchmark (tests/test_dot_scaled_fused.py):
+  FC1 [384x7168x4096]: float32=5.16ms → dot_scaled=0.69ms (7.5x)
+  FC2 [384x2048x7168]: float32=2.58ms → dot_scaled=0.32ms (8.1x)
+```
+
+**kernel 快了 7.5x，零误差。**
+
+#### 5. 调度优化
+
+原来的 `m_grouped_fp8_fp4_gemm_nt_contiguous_triton` 每次调用：
+- `unique()` + 6× `nonzero()` = 7 次 GPU→CPU sync
+- 6× `index_select` + 6× `index_copy_` = 12 次 GPU kernel
+- 120 次/token = ~1560 次 sync
+
+优化后：
+- `argsort` + diff + 1× `nonzero` = 2 次 GPU→CPU sync
+- 1× `index_select`（所有有效行一次取出，per-expert 用 slice 零拷贝）
+- 1× `index_copy_`（一次性 scatter 回去）
+- 120 次/token = ~240 次 sync
+
+### 端到端实测结果
+
+```
+英文 "What is quicksort? Explain with code."
+→ 500 tokens / 237s = 2.11 tok/s ✅ 干净英文，零垃圾
+
+中文 "请用500字介绍万里长城"
+→ 464 tokens / 230s = 2.0 tok/s ✅（FP8 fused 版本）
+```
+
+### 速度演进（全部中英文正确）
+
+| 版本 | tok/s | 相对首版 | kernel 时间 |
+|------|-------|---------|------------|
+| Python fallback + CUTLASS | 0.79 | 1.0x | 14.0 ms |
+| Triton dequant + cuBLAS | 1.67 | 2.1x | 6.89 ms |
+| Fused dequant+matmul（float32） | 1.87 | 2.4x | 5.16 ms |
+| FP8 fused | 2.0 | 2.5x | 3.64 ms |
+| **dot_scaled + 调度优化** | **2.11** | **2.7x** | **0.69 ms** |
+
+kernel 从 14.0ms 降到 0.69ms（20x），端到端从 0.79 到 2.11（2.7x）。差距说明**瓶颈已完全转移到 Python 调度开销**——kernel 时间只占端到端的 ~4%，剩余 96% 是 Python 循环 + GPU↔CPU sync + 小 tensor 分配。
+
+### 剩余瓶颈
+
+每 token ~475ms 中：
+- dot_scaled kernel: ~0.69ms × 120 = ~83ms（17%）
+- FP8 activation dequant: ~0.06ms × 120 = ~7ms（1.5%）
+- Python 调度 + sync: ~385ms（81%）——argsort/nonzero/index_select/index_copy/for 循环
+
+### 下一步方向
+
+1. **Grouped dot_scaled kernel**：把 6 个专家合成一次 kernel launch，彻底消灭 Python 循环
+2. **christopherowen CUTLASS 路径**：native SM12x FP4 MMA（72 tok/s on GPT-OSS-120B），但需要移植三层联动代码
+3. **Triton dot_scaled native codegen 修复**：等 Triton 修复 SM120 的 FP4 native MMA codegen（issue #7550），从 bf16 emulation 升级到 native 指令，kernel 本身还能再快
+
+### 改动文件
+
+```
+Consumer-DeepGEMM/
+├── consumer_deep_gemm/
+│   ├── __init__.py         — CDG_PROFILE 默认关闭（去掉 cuda.synchronize 开销）
+│   └── triton_moe.py       — 新增 _e2m1_to_fp8, _fused_fp8_matmul_kernel,
+│                              _dot_scaled_matmul_kernel; 调度优化（argsort 替代 unique+nonzero）
+└── tests/
+    ├── test_fp8_fused.py        — FP8 fused 正确性 + 速度
+    └── test_dot_scaled_fused.py — dot_scaled 正确性 + 速度
+```
+
+### 当前镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 用途 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | Fused float32 基线 |
+| `vllm-node-sm121-cdg:fp8` | ✅ | ✅ | 2.0 tok/s | FP8 tensor core |
+| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.11 tok/s | dot_scaled + 调度优化 |
