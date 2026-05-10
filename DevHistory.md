@@ -2145,8 +2145,36 @@ Consumer-DeepGEMM/
 | `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.2 tok/s | CDG shim 外挂 |
 | **`vllm-node-jasl-fix:latest`** | **✅** | **✅** | **4.1 tok/s** | **oracle 强制 DEEPGEMM + 去 FP8 无用功** |
 
+### Grouped kernel 尝试（失败）
+
+把 6 次 dot_scaled kernel launch 合成 1 次（grid 第三维 = expert 数量）。结果 3.6 tok/s——比循环版 4.1 更慢。原因：metadata tensor 创建开销 + max_M padding 导致空跑 thread block + Triton 3D grid 调度成本。回退到循环版。
+
+### 跳过 CDG 冗余 sort 尝试（失败）
+
+`deepgemm_moe_permute` 已按 expert 排序行，CDG 内部又做了一次 argsort。尝试直接在 apply 里从 expert_ids 做 segment detection 跳过 CDG 的 sort。结果全乱码——padding 行的偏移计算有 bug，`deepgemm_moe_permute` 的输出 layout（padding 行位置）需要更仔细的处理。回退。
+
+### Profiling（去掉 FP8 后，2026-05-10 晚）
+
+```
+BF16 input path (no FP8 round-trip):
+  sort+segment:       0.039 ms   2.7%
+  index_select:       0.009 ms   0.6%
+  6x_kernels:         1.174 ms  82.0%
+  1x_kernel:          0.151 ms  10.5%
+  index_copy:         0.011 ms   0.8%
+  full_bf16:          1.431 ms 100.0%
+  full_fp8_input:     1.618 ms  (old FP8 path)
+
+  Per token (×120): 172 ms = 5.82 tok/s (理论上限)
+  Kernel only:      141 ms
+  Overhead:         31 ms
+```
+
+如果 6 次合 1 次：1.431 - 1.174 + 0.151 = 0.408 ms → 理论 20.4 tok/s。但 grouped kernel 实测反而更慢。
+
 ### 下一步优化方向
 
-1. **减少 Python 循环**——把 6 次 dot_scaled kernel launch 合成 1 次 grouped kernel
-2. **简化 permute**——当前走 `deepgemm_moe_permute`（含 `ep_scatter` CUDA kernel + dummy scale），可以换成更轻量的 `moe_align_block_size`
-3. **SwiGLU 融合**——`_act_mul_quant` 换成不做 FP8 requant 的版本，省一步
+1. **修复 grouped kernel 的性能**——避免 max_M padding 空跑，优化 metadata 传递
+2. **修复跳过冗余 sort**——搞清楚 `deepgemm_moe_permute` 的 padding layout 再重试
+3. **等 Triton 修 SM120 native FP4 codegen**（issue #7550）——dot_scaled 从 bf16 emulation 升级到 native MMA，kernel 本身再快几倍
+4. **修 Marlin 的 sm_120 bug**——终极方案，直接 14 tok/s + 英文正确
