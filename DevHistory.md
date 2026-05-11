@@ -2043,6 +2043,95 @@ sm_121 实际行为（线性顺序）：
 
 **结论：shfl fix 方向错误。** 不管 native 还是 PTX JIT，加 shfl 都让输出崩溃。我们的 ldmatrix 测试可能有 bug，或者 ldmatrix 行为差异不是 Marlin 乱码的原因——Marlin 的 sm_80 PTX JIT + sm_121 ldmatrix 的组合是"部分工作"的状态，shfl 打破了这个部分补偿。
 
+### ldmatrix 追加校准（2026-05-11）
+
+前面的“sm_121 `ldmatrix` 不看 per-lane 地址、只线性读”说法过强。新的 `test_ldmatrix_address_probe.cu` 证明：
+
+- `ldmatrix.sync.aligned.m8n8.x4.shared.b16` 在 sm_121 上仍然使用 per-lane shared address。
+- x4 被拆成 4 个 8-lane address group：`frag0` 用 lane 0-7 的地址，`frag1` 用 lane 8-15，`frag2` 用 lane 16-23，`frag3` 用 lane 24-31。
+- 差异在 group 内的 lane→元素分配：sm_121 实际近似为 `src_addr_lane = frag*8 + lane/4, offset = 2*(lane%4)`；sm_80/90 预期是 `src_addr_lane = frag*8 + lane%8, offset = 2*(lane/8)`。
+- 因此连续 row-address probe 上的补偿 shfl 公式仍是 `src_lane = (lane%8)*4 + lane/8`。
+
+进一步用 `test_marlin_a_ldmatrix_swizzle.cu` 把 Marlin 的 A 侧 `transform_a()` / `a_sh_rd_trans` 加进去验证：
+
+| 配置 | raw vs sm80 oracle | shfl vs sm80 oracle |
+|---|---:|---:|
+| large 64x256, moe_block=64, linear fill | 120/128 mismatch | 0/128 mismatch |
+| large 64x256, moe_block=64, Marlin `transform_a` fill | 120/128 mismatch | 0/128 mismatch |
+| large 64x128, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+| large 128x64, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+| small 128x128, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+
+结论修正：**Marlin A 侧 shared swizzle 不会破坏这个 shfl 补偿。** 之前 “shfl fix 空白” 不能再归因于 A 侧 `transform_a`。更可能的解释是：A fragment 被修到 sm80 oracle 后，B/scale/permutation 侧仍按另一套布局错位，原本的局部补偿被拆掉，输出直接崩。下一步应验证 FP4 B dequant 后的 `FragB` / `mma.sync` 寄存器布局，而不是继续只盯 A 侧 `ldmatrix`。
+
+### B fragment 方向切换（2026-05-11）
+
+新增 `test_mma_b_fragment_layout.cu`，用同一个 A fragment 做对照：
+
+- A 从 shared identity matrix 用 `ldmatrix.x4` 读取，并套用 A 侧 shfl 修正。
+- B reference 用 `ldmatrix.x2.trans` 从 shared 读取，作为 tensor core 接受的 BF16 B fragment oracle。
+- B manual 用 Marlin 风格的两个 BF16 pair 寄存器直接喂给 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`。
+
+结果：
+
+```text
+mma output diff: ref vs manual_a = 32 / 128
+mma output diff: ref vs manual_b = 32 / 128
+
+lane 0 ref0=[1,101] ref1=[800,900] manual0=[1,2] manual1=[3,4]
+lane 1 ref0=[201,300] ref1=[1000,1104] manual0=[5,6] manual1=[7,8]
+...
+```
+
+含义：B operand 的寄存器布局不是 lane 连续的 `[lane*4+1..lane*4+4]`，也不是简单交换 `b[0]/b[1]`。Marlin B 侧实际路径是：
+
+`gptq_marlin_repack` → kernel 里 `int4* sh_b_stage` → `frag_b_quant[k][0][j]` → `dequant<bf162, FE2M1f>` 的 reverse indexing → `mma`。
+
+因此下一步应做 **repack 级 tile probe**：构造 16×64 的可控 4-bit weight tile，复刻 `gptq_marlin_repack_kernel` 的 `tc_row/tc_col/tc_offsets/pack_idx`，再检查每个 lane 的 `b_quant_0/b_quant_1` 经 dequant 后是否等价于 B reference fragment。A 侧已经不是主嫌。
+
+追加：`test_marlin_fp4_dequant_order.cu` 直接 dump 了 `dequant<nv_bfloat162, FE2M1f, true>` 的 nibble 消费位置。它只读取输入 word 的 nibble 2/3/6/7；但 MXFP4 分支实际是：
+
+```cpp
+b_quant_1 = frag_b_quant[k][0][j];
+b_quant_0 = b_quant_1 << 8;
+```
+
+所以 `b_quant_0` 消费原 word 的 nibble 0/1/4/5，`b_quant_1` 消费原 word 的 nibble 2/3/6/7。结合 `gptq_marlin_repack` 的 `pack_idx = {0,2,4,6,1,3,5,7}`，B 侧顺序正好恢复成：
+
+- `frag_b0[0] = [k0,n], [k1,n]`
+- `frag_b0[1] = [k8,n], [k9,n]`
+- `frag_b1[0] = [k0,n+8], [k1,n+8]`
+- `frag_b1[1] = [k8,n+8], [k9,n+8]`
+
+这和 `ldmatrix.x2.trans` 的 B fragment oracle 对齐。当前判断：**B 核心 nibble/repack/dequant 顺序不是主嫌**。
+
+### A-shfl 补丁重试与构建阻塞（2026-05-11）
+
+基于 A/B probe，重新把最小 A 侧补偿打到 `spark-vllm-docker/vllm-sm120/csrc/moe/marlin_moe_wna16/marlin_template.h` 的 `ldsm<count==4>`：
+
+```cpp
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+int lane = threadIdx.x & 31;
+int src_lane = (lane % 8) * 4 + lane / 8;
+a[0] = __shfl_sync(0xffffffff, a[0], src_lane);
+...
+#endif
+```
+
+这次只动 A operand 的 `ldmatrix.x4`，不碰 B、scale、repack、`count==2`。
+
+为了验证真实 vLLM 路径，修了 `rebuild_moe_c.sh`：
+
+- include 改为绝对 `csrc`
+- 加入容器内 CUTLASS include：`flashinfer/data/cutlass/include`
+- 加入 `.deps/vllm-flash-attn-src/csrc/cutlass/tools/util/include`
+- 解除 PyTorch extension 默认的 BF16/half conversion 禁用
+- 构建前生成 `csrc/moe/marlin_moe_wna16/kernel_selector.h`
+
+结果：对象编译能走到 30/30，但最终链接失败，大量 `Marlin<...>` specialization undefined。原因是这个 `torch.utils.cpp_extension` 快速脚本没有复刻 vLLM CMake 对 Marlin specialization 的完整生成/链接规则。脚本已改成 `generate_kernels.py 8.0,12.1`，但尚未重新完整验证。
+
+当前状态：**源码层 A-shfl 补丁已存在，但没有真实服务验证；不能记为有效优化。** 下一步要么继续修快速重编脚本的 specialization 集合，要么放弃脚本，走原 vLLM CMake build 生成 `_moe_C`。
+
 ### 关键发现：`__CUDA_ARCH__ < 890` 的 FP8 guard（第 296-298 行）
 
 ```cpp
@@ -2098,7 +2187,7 @@ Consumer-DeepGEMM/
 │   ├── __init__.py         — CDG_PROFILE 默认关闭（去掉 cuda.synchronize 开销）
 │   └── triton_moe.py       — 新增 _e2m1_to_fp8, _fused_fp8_matmul_kernel,
 │                              _dot_scaled_matmul_kernel; 调度优化（argsort 替代 unique+nonzero）
-└── tests/
+ └── tests/
     ├── test_fp8_fused.py        — FP8 fused 正确性 + 速度
     └── test_dot_scaled_fused.py — dot_scaled 正确性 + 速度
 ```
@@ -2211,3 +2300,289 @@ test_multistream.py:
 2. **修 Marlin 的 sm_120 bug**——终极方案，直接 14 tok/s + 英文正确。根因已定位到 ldmatrix 行为差异，但修复需要理解 Marlin 完整的 smem swizzle pattern
 3. **升级 CUTLASS 到 v4.4.2**——christopherowen 的 64×128 tile patch 可用
 4. **写 C++ dispatch 循环**——把 6 次 Triton kernel launch 的 Python 循环搬到 C++ 里，消除 Python→Triton→CUDA 的调用链开销（虽然 profiling 显示 Python OH ≈ 0，但每次 Triton JIT dispatch 有固定开销）
+
+### 2026-05-11 追加：Grouped dot_scaled 实验降级
+
+继续检查 5-10 深夜的结论：把 6 次 expert dot_scaled kernel 合成 1 次 grouped launch，在独立 microbenchmark 有收益，但 vLLM 端到端更慢。
+
+本轮把已有 `_grouped_dot_scaled_kernel` 整理成独立实验路径，但**不作为默认路径启用**：
+
+- 新增 `triton_grouped_fused_fp4_matmul_nt`
+- 默认仍走 per-expert loop，保持 4.1 tok/s 的已验证路径
+- 设置 `CDG_GROUPED_DOT_SCALED=1` 才启用 grouped launch
+- 新增 `tests/test_grouped_dot_scaled.py`，但默认跳过；需要 `CDG_RUN_UNSAFE_GROUPED_TEST=1` 才跑
+- 清理 `tests/test_fused_e2e.py` 的硬编码路径和旧标签
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm121-cdg:dot-scaled \
+  bash -lc 'PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_grouped_dot_scaled.py && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_fused_e2e.py'
+```
+
+默认安全测试结果：
+
+```text
+Grouped dot_scaled test is disabled by default; set CDG_RUN_UNSAFE_GROUPED_TEST=1 to run it.
+FC1 [M=384, K=7168, N=4096]:
+  Current default:      1.47 ms
+  Explicit baseline:    1.54 ms
+  Current/baseline:     1.05x
+
+FC2 [M=384, K=2048, N=7168]:
+  Current default:      0.76 ms
+  Explicit baseline:    0.84 ms
+  Current/baseline:     1.10x
+```
+
+额外发现：强行跑 grouped 路径时，短测试可出现 `max_diff=0`，但随后 CUDA 报 `illegal memory access`。这说明 grouped kernel 可能有越界写或 Triton `dot_scaled` + 3D grid 的隐藏问题。结论更新：**grouped launch 不是可用优化，只能作为失败实验/后续排查样本保留**。
+
+当前默认路径没有变化：per-expert loop + BF16 input + dot_scaled，仍是 `vllm-node-jasl-fix` 的 4.1 tok/s 正确路径。
+
+### 2026-05-11 追加：Marlin ldmatrix A 侧补偿实验
+
+目标：继续追 14 tok/s 正确路径，验证 Marlin 在 SM120/SM121 上的 `ldmatrix` 行为差异是否能通过寄存器重排修复。
+
+#### ldmatrix 行为探针
+
+`test_ldmatrix_address_probe.cu` 证明 GB10/SM121 的 `ldmatrix.x4` 取数模式和 SM80 语义不同：
+
+```text
+sm121 actual: src_addr_lane = frag * 8 + lane / 4, offset = 2 * (lane % 4)
+sm80 expected: src_addr_lane = frag * 8 + lane % 8, offset = 2 * (lane / 8)
+补偿映射: src_lane = (lane % 8) * 4 + lane / 8
+```
+
+`test_marlin_a_ldmatrix_swizzle.cu` 用 Marlin 的 `transform_a` / `a_sh_rd_trans` 复现 A 侧 swizzle，结果：
+
+```text
+raw vs sm80 oracle: 120 / 128 mismatch
+shfl vs sm80 oracle: 0 / 128 mismatch
+```
+
+结论：A operand 的 `ldmatrix.x4` 后做 `__shfl_sync` 补偿，在 Marlin A 侧共享内存 swizzle 下仍然数学正确。
+
+#### 构建坑
+
+最开始用宿主 `spark-vllm-docker/vllm-sm120/csrc` 直接 `glob csrc/moe/**/*.cu` 手工重编 `_moe_C` 是错的：会把 CMake 本来不放进 `_moe_C` 的 `mxfp8_moe/cutlass_mxfp8_*`、`dsv3_router_gemm_*` 等源文件一起编进去，符号和镜像原版不一致，模型加载会在 `w2.copy_ -> cudaMemcpyAsync` 阶段卡死。
+
+正确做法：用嵌套源码 `spark-vllm-docker/vllm-sm120/vllm-sm120/`，按 `CMakeLists.txt` 的 `VLLM_MOE_EXT_SRC` 精确源集手工编译：
+
+- `torch_bindings.cpp`
+- `moe_align_sum_kernels.cu`
+- `topk_softmax_kernels.cu`
+- `moe_wna16.cu`
+- `grouped_topk_kernels.cu`
+- `router_gemm.cu`
+- `topk_softplus_sqrt_kernels.cu`
+- `permute_unpermute_kernels/moe_permute_unpermute_kernel.cu`
+- `moe_permute_unpermute_op.cu`
+- generated `marlin_moe_wna16/sm80_kernel_*.cu`
+- generated `marlin_moe_wna16/sm89_kernel_*.cu`
+- `marlin_moe_wna16/ops.cu`
+
+这版 `_moe_C.abi3.so` 可正常启动，权重加载时间同原版同量级。
+
+#### 实机结果
+
+补丁：只在 `ldsm<count == 4>` 后对 A fragment 做 lane shuffle：
+
+```cpp
+int lane = threadIdx.x & 31;
+int src_lane = (lane % 8) * 4 + lane / 8;
+a[0] = __shfl_sync(0xffffffff, a[0], src_lane);
+a[1] = __shfl_sync(0xffffffff, a[1], src_lane);
+a[2] = __shfl_sync(0xffffffff, a[2], src_lane);
+a[3] = __shfl_sync(0xffffffff, a[3], src_lane);
+```
+
+英文测试仍然垃圾：
+
+```text
+Prompt: What is quicksort? Explain with code.
+300 tokens / 36.26s = 8.27 tok/s
+Output: "## (îîî plutôt( plutôt(... 而非而非..."
+```
+
+结论：**A 侧 ldmatrix 补偿是必要局部修正，但不是 Marlin 英文乱码的完整根因。** 下一步应转向 B/scale/repack：
+
+1. 验证 B 侧 `ldmatrix.trans.x2` 或等价 tensor-core B fragment 布局在 SM121 上是否也变了。
+2. 复核 MXFP4 `gptq_marlin_repack`、`dequant<FE2M1f>`、`b_quant_0/b_quant_1` 的组合顺序。
+3. 如果 B 侧存在同类 lane-group 重排，补偿点不在 shared load，而可能在 `frag_b_quant -> dequant -> FragB` 的寄存器顺序。
+
+#### B fragment / FP4 nibble 顺序确认
+
+`test_mma_b_fragment_layout.cu` 先确认 B operand 不能按连续 lane 值手搓；`ldmatrix.x2.trans` 给 MMA 的 B fragment 是 K/N 交错布局。随后新增 `test_b_pack_perm_search.cu`，用 identity A + BF16 MMA 穷举 lane-local B 候选顺序，得到硬结果：
+
+```text
+best diff 0 / 128
+required first B operand nibble order: {0,1,4,5}
+```
+
+而当前 Marlin FP4 repack 的 word 内顺序是：
+
+```text
+old packed word: {0,2,4,6,1,3,5,7}
+dequant_data reads positions {2,3,6,7}
+current FE2M1 path feeds first MMA operand: {0,2,1,3}
+```
+
+因此 A 侧补偿后仍乱码是合理的：B 侧第一组 MMA operand 被喂错。补丁已加到 `spark-vllm-docker/vllm-sm120/vllm-sm120/csrc/moe/marlin_moe_wna16/marlin_template.h` 的 FE2M1 分支，只对 `__CUDA_ARCH__ >= 1200` 生效，在 dequant 前用寄存器 bit 操作把旧 word 重组为：
+
+```text
+frag_b0 sees {0,1,4,5}
+frag_b1 sees {2,3,6,7}
+```
+
+小型 MoE correctness probe `test_moe_marlin_fp4_probe.py` 已通过：
+
+```text
+max_abs 4.3392181396484375e-05
+mean_abs 5.1775491556327324e-06
+torch.testing.assert_close(atol=4e-2, rtol=0) passed
+```
+
+这说明寄存器级 B 重排方向正确，至少在随机 MXFP4 MoE 小矩阵上，Marlin 输出已经贴近 torch 参考。
+
+#### 当前阻塞
+
+重编 exact-source `_moe_C.abi3.so` 后必须同时同步到两台机器；否则 head/worker 挂载本地路径会拿到不同 so。已确认并同步：
+
+```text
+head/worker sha256: 4f3624551e7cdf1deb229bf3c651afe1006d8951f02f21763148defc95af8a7b
+```
+
+但双机整模型加载仍卡在 safetensors `30/46` 附近，GPU util 0%，head `RayWorkerWrapper.execute_method` 单核高 CPU。这个卡点发生在生成前，和小型 MoE kernel correctness 分开看。下一步不要继续盲等整模型；应做两件事：
+
+1. 用原镜像 `_moe_C` 的构建方式复刻 96MB mixed-cubin so，只把 A/B 两处补丁打进去，避免 exact-source so 和镜像 ABI/符号集有细微差异。
+2. 或直接在镜像内原地替换源码后按镜像自己的构建脚本重编 `_moe_C`，再测整模型英文输出。
+
+### 2026-05-11 继续验证：fatbin 布局对齐与 `jasl-fix` 后端强制分支
+
+#### 修正 exact-source 重链脚本
+
+上一版 `rebuild_exact_moe_c.sh` 的问题不是 kernel 数值，而是链接顺序：脚本用
+`sorted(glob(...*.o))` 重链，导致 `ops.o` 提前，fatbin cubin 编号变成：
+
+```text
+2 sm120 + 14 sm80 + 12 sm120
+```
+
+这和镜像自带 `_moe_C.abi3.so` 的布局不同。已修正为按 source list 顺序重链，并把
+`marlin_moe_wna16/ops.cu` 也重编为 `sm_80`。新产物：
+
+```text
+sha256: 5d53a2467850dd230c58a73575aa4fb0da570049e6aa574f6e6ab4172016f462
+cubin layout: 8 sm120 + 14 sm80 + 5 sm120 + 1 sm80
+```
+
+这个布局已经和 `vllm-node-jasl` / `vllm-node-jasl-fix` 自带 so 对齐。real checkpoint probe 通过：
+
+```text
+python3 test_real_mxfp4_marlin_probe.py 8 2 6
+max_abs 0.0001220703125
+mean_abs 1.0350617e-05
+```
+
+#### `jasl-fix + 新 _moe_C + 强制 DeepGEMM` 结果
+
+只挂载新 `_moe_C`，使用 `vllm-node-jasl-fix --moe-backend marlin` 可完整加载并输出正常英文，但日志显示：
+
+```text
+mxfp4.py: DGX Spark: forcing DEEPGEMM_MXFP4 backend (Marlin has bugs on sm_12x)
+```
+
+也就是说 `jasl-fix` 的 Python oracle 在 `select_mxfp4_moe_backend()` 开头硬 return DeepGEMM，`--moe-backend marlin` 没真正生效。实测 prompt：
+
+```text
+220 completion tokens / 61.58s = 3.57 tok/s
+输出正常英文
+```
+
+这不是提速路径，只是正确性基线。
+
+#### `jasl-fix + 新 _moe_C + 正常 oracle` 结果
+
+把本地正常版
+`vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`
+也挂进 `jasl-fix` 后，强制 DeepGEMM 分支消失，加载再次卡在 30/46。`py-spy` 栈：
+
+```text
+cuMemcpyHtoDAsync_v2
+torch copy_
+_load_w13 (vllm/model_executor/layers/fused_moe/layer.py:1003)
+weight_loader
+load_weights
+```
+
+worker 已 idle，head 单 worker 高 CPU。结论：Marlin kernel / repack 在 isolated probe 上正确，但完整模型 Marlin 权重加载路径仍有大模型级别卡死问题。当前不要再调 `ldmatrix`，下一步应定位 `_load_w13/_load_w2` 在 Marlin experts 下的实际目标张量 shape、stride、device allocation 和内存余量，找出为什么完整 256 experts 加载卡在 HtoD。
+
+#### Host 重启后复测
+
+Zero 重启 host 后复跑同一配置：
+
+```text
+vllm-node-jasl-fix
++ 新 _moe_C
++ 正常 oracle/mxfp4.py
++ --moe-backend marlin
+```
+
+仍卡在 safetensors `30/46`。这次可排除“宿主脏状态偶发卡死”。栈保持一致：
+
+```text
+head rank:
+cuMemcpyHtoDAsync_v2
+torch copy_
+_load_w13 (vllm/model_executor/layers/fused_moe/layer.py:1003)
+
+worker rank:
+load_model -> current_memory_usage
+```
+
+所以当前硬结论更新为：**真实 Marlin 路径不是生成期算错，而是完整模型加载期在 rank0 的 `w13` HtoD 拷贝卡住。** `ldmatrix` 仍是已修复的 kernel 内部 bug，但已经不是当前阻塞点。
+## 2026-05-11 Marlin full-model retry after head+slave reboot
+
+- Retried true Marlin path after rebooting both head and slave. It still hangs at 30/46 with `max_model_len=131072`, so the previous hang is not dirty host/slave runtime state.
+- Added `VLLM_MOE_LOAD_TRACE` probes in `fused_moe/layer.py`. The 131k load hang is not tied to one fixed tensor:
+  - head/rank0 stopped in `expert_data.copy_()` around `model.layers.29.ffn.experts`, last visible tensor `w3 expert=217`, source/target 2 MiB.
+  - slave/rank1 stopped in `expert_data.copy_()` around `model.layers.19.ffn.experts`, last visible tensor `w2 expert=8`, source/target 2 MiB.
+  - This points to loading-time CUDA allocator/memory pressure, not safetensors corruption or a single bad expert.
+- Re-ran true Marlin with `max_model_len=4096`; full model loads successfully. Model memory is about 73.85 GiB per GB10 and vLLM reports ~27-29 GiB available for KV after load. Therefore the 131k failure is a memory/slack issue specific to true Marlin under the `jasl-fix` image.
+- However, 4k true Marlin generation is still garbage, even with the fixed `_moe_C`:
+  - Example prompt returned mixed fragments such as `GP,_然後...`, not coherent English.
+  - Throughput for the bad output was about 4.26 tok/s on a short prompt.
+- Added `test_real_mxfp4_marlin_tp_probe.py` to test real checkpoint MXFP4 weights with vLLM-style TP partitioning:
+  - `w1/w3` split along intermediate dimension.
+  - `w2` split along intermediate input dimension.
+  - rank0 and rank1 Marlin outputs are summed and compared to full BF16 dequant reference.
+  - Result: PASS, max_abs `0.000244140625`, mean_abs `2.3e-05` for `experts=8 m=2 topk=6`.
+- Patched `fused_marlin_moe.py` so the normal `MarlinExperts.apply()` path passes `clamp_limit=self.gemm1_clamp_limit`, matching the LoRA path. DeepSeek V4 has `swiglu_limit=10.0`, so this was a real integration bug. The patch loaded correctly, but full-model output remained garbage.
+- Current diagnosis:
+  - ldmatrix/MMA/nibble reorder: isolated and TP probes pass.
+  - weight loading layout: real checkpoint + TP probes pass.
+  - full-model Marlin: still wrong at the FusedMoE runner/module integration layer.
+  - Next useful test is a runner-level single-layer DeepGEMM-vs-Marlin comparison using actual `FusedMoE` routing/topk/prepare/finalize, not another raw GEMM probe.
+
+### 2026-05-11 Follow-up after rebooting both nodes
+
+- Retested 4k true Marlin after both head and slave were rebooted. Full model loads successfully, but generation is still corrupted:
+
+```text
+96 completion tokens / 21.84s = 4.40 tok/s
+output: GPUs�名思义�后续GP后续...
+```
+
+- `--enforce-eager` is confirmed in the logs, so CUDA graph capture is not the corruption source.
+- A/B tested `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`; output remains corrupted. Shared-expert aux stream overlap is not the source.
+- Added `test_real_mxfp4_marlin_expert_map_probe.py` to cover the real TP expert-map path that earlier probes missed:
+  - local rank-1 style experts `128..255`
+  - `expert_map` maps global expert id to local id
+  - mixed valid/invalid top-k ids to simulate real TP routing before all-reduce
+  - layer 0 and layer 41 both pass against BF16 dequant reference with max_abs around `1e-4..2e-4`
+- Tried to expose `batched_marlin` through CLI for an upper-layer A/B, but this vLLM build does not accept it as a public `--moe-backend` choice.
+
+Current narrowed conclusion: true Marlin's raw kernel, TP sharding, expert-map masking, and mixed-rank routing all pass. The remaining likely fault is a full runner/model interaction that is not reproduced by standalone `fused_marlin_moe()` probes. Next best test is to instantiate one real `DeepseekV4MoE/FusedMoE` layer in-process and compare Marlin vs DeepGEMM at the layer boundary with the same hidden states and router logits.

@@ -5,7 +5,7 @@ set -e
 cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
 
 echo "=== Step 1: Stop existing service ==="
-./launch-cluster.sh -t vllm-node-jasl-fix stop 2>/dev/null || true
+# ./launch-cluster.sh -t vllm-node-jasl-fix stop 2>/dev/null || true
 ssh lmxxf@169.254.30.81 "docker rm -f vllm_node 2>/dev/null" || true
 
 echo "=== Step 2: Build vLLM ==="

@@ -4,21 +4,21 @@
 
 两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 运行 DeepSeek V4 Flash (280B, 158GB FP4)。
 
-## 当前状态（2026-05-04）
+## 当前状态（2026-05-11）
 
 | 场景 | 状态 | 速度 |
 |------|------|------|
-| 中文问答/写作/代码 | 完美 | ~14 tok/s |
-| 英文问答/代码 | 偶尔开头出垃圾 token | ~14 tok/s |
+| 中文问答/写作/代码 | **完美** | **~12 tok/s** |
+| 英文问答/代码 | **完美** | **~12 tok/s** |
 
-基于 jasl/vllm fork（`ds4-sm120` 分支），用 Triton 重写了 DeepSeek V4 的关键 kernel，绕过 Marlin 在 sm_120+ 上的静默计算错误。英文残留问题是社区已知的，等 jasl 继续覆盖残余路径或 vLLM 官方修复（issue #40928）。
+基于**混合后端**方案：42 层走 Marlin（快），最后一层 MoE 回退到 DeepGEMM（[Consumer-DeepGEMM](https://github.com/lmxxf/Consumer-DeepGEMM) 的 Triton `tl.dot_scaled` kernel，正确）。Marlin 的数值误差在单层内可接受，但经 43 层累积后在 logits 处放大导致英文输出崩坏——只回退最后一层就能修复。
+
+底层基于 [jasl/vllm](https://github.com/jasl/vllm/tree/ds4-sm120) fork，用 Triton 重写了 attention/MLA kernel 适配 SM120+。
 
 ## 硬件
 
 - DGX Spark ×2，各 128GB 统一内存，GPU: NVIDIA GB10 (sm_121)
 - QSFP56 DAC 线缆，ConnectX-7 200Gbps RDMA 直连
-- **host (spark-3a10)**：192.168.31.198 / CX7: 169.254.248.35
-- **slave (spark-e8bb)**：192.168.31.172 / CX7: 169.254.30.81
 
 ## 预构建镜像
 
@@ -28,7 +28,7 @@
 docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
 ```
 
-基于 jasl/vllm `ds4-sm120` 分支（2026-05-04），跳到第 4 步启动服务，把 `-t vllm-node-jasl` 改成 `-t lmxxf/vllm-deepseek-v4-dgx-spark`。
+基于 jasl/vllm `ds4-sm120` + 混合后端补丁（2026-05-11），跳到第 4 步启动服务，把 `-t vllm-node-jasl-marlin-fix` 改成 `-t lmxxf/vllm-deepseek-v4-dgx-spark`。
 
 ## 从零开始
 
@@ -54,22 +54,20 @@ host 上下载：
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
-  --local-dir /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash
+  --local-dir ./deepseek-v4-flash
 ```
 
 rsync 到 slave（走 CX7，581MB/s）：
 
 ```bash
-rsync -avP /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/ \
-  lmxxf@<slave_CX7_IP>:/home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/
+rsync -avP ./deepseek-v4-flash/ user@<slave_CX7_IP>:./deepseek-v4-flash/
 ```
 
 ### 3. 构建 Docker 镜像
 
-核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork（Triton 重写 DeepSeek V4 关键 kernel）。
+核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork + 混合后端补丁。
 
 ```bash
-# 克隆构建工具
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 ```
@@ -92,27 +90,41 @@ cd spark-vllm-docker
 ### 4. 启动推理服务
 
 ```bash
-HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
-VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
-./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl exec \
+HF_HOME=/path/to/weights/parent \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="\
+  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HUB_OFFLINE=1 \
+  -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
+" \
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl-marlin-fix exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.80 \
   --kv-cache-dtype fp8 \
-  --max-model-len 131072 \
-  --enforce-eager
+  --max-model-len 4096 \
+  --enforce-eager \
+  --moe-backend marlin
 ```
 
 关键参数：
-- `--enforce-eager`：禁用 CUDA graph（sm_120+ 兼容性问题）
-- `--kv-cache-dtype fp8`：DeepSeek V4 要求 FP8 KV cache
-- `--max-model-len 131072`：128K 上下文，可按需调整
+- `--moe-backend marlin`：MoE 使用 Marlin 后端（快）
+- `VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42`：最后一层 MoE 回退到 DeepGEMM（正确）。这是核心修复——Marlin 的数值误差在 layer 42 累积到不可接受
+- `--enforce-eager`：禁用 CUDA graph（sm_120+ 兼容性）
+- `--kv-cache-dtype fp8`：DeepSeek V4 要求
+- `--max-model-len 4096`：先用小上下文；131072 在 Marlin 权重加载时可能卡住
+- `--gpu-memory-utilization 0.80`：防止 worker 节点 OOM
+
+启动后确认日志里有：
+```
+Using 'MARLIN' Mxfp4 MoE backend.
+MXFP4 layer 42 forced to DEEPGEMM_MXFP4 by VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
+```
 
 ### 5. 停止
 
 ```bash
-./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl stop
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl-marlin-fix stop
 ```
 
 重启前必须先 stop——否则 slave 上的容器还在跑。不要直接 ctrl-c。
@@ -120,102 +132,69 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS="-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1" \
 ### 6. 测试
 
 ```bash
-# 短输出测试（中文，应正确）
-curl -s http://localhost:8000/v1/chat/completions \
+# 中文
+time curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"2+2等于几"}],"max_tokens":50}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用200字介绍万里长城"}],"max_tokens":300}' \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); u=r['usage']; print(f\"tokens: {u['completion_tokens']}\"); print(r['choices'][0]['message']['content'][:300])"
 
-# 长输出测试（中文，应正确，~14 tok/s）
-curl -s http://localhost:8000/v1/chat/completions \
+# 英文
+time curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"请用500字介绍万里长城"}],"max_tokens":600}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":200}' \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); u=r['usage']; print(f\"tokens: {u['completion_tokens']}\"); print(r['choices'][0]['message']['content'][:300])"
 
-# 代码测试（中文 prompt，应正确）
-curl -s http://localhost:8000/v1/chat/completions \
+# 数学
+time curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"写一个Python快速排序函数"}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
-
-# 英文测试（已知问题：可能出现垃圾 token）
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"What is quicksort? Explain with code."}],"max_tokens":500}' | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin),ensure_ascii=False,indent=2))"
+  -d '{"model":"/root/.cache/huggingface/deepseek-v4-flash","messages":[{"role":"user","content":"17 * 23 = ?"}],"max_tokens":50}' \
+  | python3 -c "import sys,json; r=json.load(sys.stdin); u=r['usage']; print(f\"tokens: {u['completion_tokens']}\"); print(r['choices'][0]['message']['content'])"
 ```
 
 预期结果：
 
-| 测试 | 预期 | 实测速度 |
-|------|------|----------|
-| 中文短回复（2+2） | 正确 | 首次含 warmup ~17s，后续 <1s |
-| 中文长输出（万里长城） | 正确，finish_reason=stop | ~14 tok/s |
-| 中文代码（快速排序） | 正确，代码可运行 | ~14 tok/s |
-| 英文代码（quicksort） | 可能出垃圾 token | ~14 tok/s |
+| 测试 | 预期 | 速度 |
+|------|------|------|
+| 中文（万里长城） | 正确，finish_reason=stop | ~12 tok/s |
+| 英文（quicksort） | **正确，干净输出** | ~12 tok/s |
+| 数学（17×23） | 正确 | ~12 tok/s |
 
-中文全对 + 英文有问题 = 部署正确（jasl fork 已知限制）。
+中英文全对 = 部署成功。
 
 ## 显存分配（双机 256GB）
 
 | 项目 | 单机 | 双机合计 |
 |------|------|----------|
 | 统一内存 | 128 GB | 256 GB |
-| 可用 GPU 显存 (~121 GB) × 0.85 | ~103 GB | ~206 GB |
-| 模型权重（TP=2，每台存一半） | 73.85 GB | ~148 GB |
-| **剩余给 KV Cache** | **~29 GB** | **~58 GB** |
+| 可用 GPU 显存 (~121 GB) × 0.80 | ~97 GB | ~194 GB |
+| 模型权重（TP=2，每台存一半） | 74.13 GB | ~148 GB |
+| **剩余给 KV Cache** | **~23 GB** | **~46 GB** |
 
-DeepSeek V4 Flash 采用 CSA + HCA 混合注意力架构，KV cache 极小——仅为传统 GQA 模型的 **~2%**。1M 上下文 fp8 KV cache 只需约 5GB。所以 58GB 的 KV cache 空间**完全支持 1M token 上下文**。
+DeepSeek V4 Flash 采用 CSA + HCA 混合注意力架构，KV cache 极小——仅为传统 GQA 模型的 ~2%。4K 上下文足够日常测试。
 
-推荐 `--max-model-len` 设置：
+## 混合后端原理
 
-| 设置 | 场景 |
-|------|------|
-| `8192` | 快速测试 |
-| `65536` | 日常多轮对话 |
-| `1000000` | 完整 1M 上下文（支持，KV cache 仅需约 5GB） |
+Marlin 的 FP4 MoE kernel 在 SM120+ 上有数据布局 bug（`ldmatrix` 指令行为和 SM80/90 不同）。每一层引入的误差很小，前 42 层都可容忍。但到第 42 层（最后一个 MoE 层），累积误差污染了 logits，输出变成垃圾。
 
-## 架构说明
+修复方法：0-41 层走 Marlin（快，单层误差可接受），第 42 层回退到 DeepGEMM（Consumer-DeepGEMM 的 Triton `tl.dot_scaled` kernel，正确但稍慢）。这个发现来自系统性的按层二分测试。
 
-```
-用户 → host:8000 (vLLM API)
-              ↓
-        Ray 调度器 (host)
-        ↙          ↘
-  GPU 0 (host)   GPU 1 (slave)
-  73.85 GiB      73.85 GiB
-        ↘          ↙
-     NCCL AllReduce (CX7 200Gbps)
-              ↓
-        输出 token
-```
-
-- **Ray**：调度员，管进程启停和资源分配
-- **NCCL**：通信层，GPU 间张量传输
-- **Tensor Parallel**：每层矩阵乘法水平切分，两台同时算，每层 AllReduce 同步
-- MoE 模型只激活 13B/280B 参数，跨机通信量相对较小
-
-## 关键技术点
-
-| 问题 | 解法 |
-|------|------|
-| Marlin FP4 MoE 在 sm_120+ 静默算错 | jasl/vllm fork 用 Triton 重写关键 kernel，绕过 Marlin |
-| DeepGEMM 不支持 sm_121 | jasl fork 内置 Triton fallback |
-| vLLM 0.20.x 未修复 sm_120+ MXFP4 MoE | 使用 jasl fork 而非官方 main |
-| PR #40082 (FlashInfer b12x) 对 V4 无效 | b12x 只注册在 NVFP4 oracle，V4 用 MXFP4 |
-| 英文输出偶尔有垃圾 token | 已知问题，等 jasl 继续覆盖残余 Marlin 路径 |
+`VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS` 支持逗号分隔的层号或半开区间（如 `42`、`40:43`、`0,42`）。
 
 ## 方案对比
 
 | 方案 | 中文 | 英文 | 速度 | 状态 |
 |------|------|------|------|------|
 | vLLM 官方 main | 静默算错 | 静默算错 | N/A | 不可用 |
-| Consumer-DeepGEMM（CUTLASS 替换 Marlin） | 正确 | 正确 | 0.8 tok/s | 正确但太慢 |
-| **jasl/vllm fork（推荐）** | **正确** | **偶尔垃圾** | **14 tok/s** | **中文日常可用** |
-| eugr exp-b12x (PR #40082) | N/A | N/A | N/A | 不适用 DeepSeek V4 |
+| jasl/vllm fork（纯 Marlin） | 正确 | 垃圾 | 14 tok/s | 仅中文 |
+| Consumer-DeepGEMM（全层） | 正确 | 正确 | 4.1 tok/s | 正确但慢 |
+| **混合后端（推荐）** | **正确** | **正确** | **12 tok/s** | **当前最优** |
 
 ## 相关链接
 
 - jasl fork: https://github.com/jasl/vllm （分支 ds4-sm120，PR #40991）
 - eugr 构建工具: https://github.com/eugr/spark-vllm-docker
-- Consumer-DeepGEMM: https://github.com/lmxxf/Consumer-DeepGEMM （CUTLASS 方案，正确但慢，学习用）
-- vLLM issue: https://github.com/vllm-project/vllm/issues/40928 https://github.com/vllm-project/vllm/issues/41063
+- Consumer-DeepGEMM: https://github.com/lmxxf/Consumer-DeepGEMM （SM120+ 的 Triton FP4 MoE kernel）
+- vLLM issue: https://github.com/vllm-project/vllm/issues/40928
 
 ## 踩坑详情
 
