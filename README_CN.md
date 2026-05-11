@@ -63,40 +63,30 @@ rsync 到 slave（走 CX7，581MB/s）：
 rsync -avP ./deepseek-v4-flash/ user@<slave_CX7_IP>:./deepseek-v4-flash/
 ```
 
-### 3. 构建 Docker 镜像
+### 3. 拉取 Docker 镜像
 
-核心方案：eugr/spark-vllm-docker 基础设施 + jasl/vllm ds4-sm120 fork + 混合后端补丁。
-
-```bash
-git clone https://github.com/eugr/spark-vllm-docker.git
-cd spark-vllm-docker
-```
-
-修改 Dockerfile 第 190 行的 clone URL：
-
-```diff
-- git clone --recursive https://github.com/vllm-project/vllm.git
-+ git clone --recursive https://github.com/jasl/vllm.git
-```
-
-构建并同步到 slave：
+混合后端补丁已固化在预构建镜像中，直接拉取即可（不需要从源码编译）：
 
 ```bash
-./build-and-copy.sh -t vllm-node-jasl -c <slave_CX7_IP> --vllm-ref ds4-sm120
+docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
 ```
 
-约 30 分钟编译 + 1 分钟同步。
+两台都要拉取。或者 host 拉取后用 `docker save | ssh slave docker load` 走 CX7 传。
+
+> **想从源码编译？** 需要先用 [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) + [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120) 编译基础镜像（~30 分钟），再用本仓库的 `Dockerfile.marlin-fix` 覆盖 4 个补丁文件。详见 [DevHistory.md](DevHistory.md)。
 
 ### 4. 启动推理服务
 
 ```bash
+cd /path/to/spark-vllm-docker
+
 HF_HOME=/path/to/weights/parent \
 VLLM_SPARK_EXTRA_DOCKER_ARGS="\
   -e TRANSFORMERS_OFFLINE=1 \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
 " \
-./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl-marlin-fix exec \
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t lmxxf/vllm-deepseek-v4-dgx-spark exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \

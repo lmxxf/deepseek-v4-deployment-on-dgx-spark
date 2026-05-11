@@ -62,42 +62,30 @@ Sync to **worker node** via CX7 (581MB/s):
 rsync -avP ./deepseek-v4-flash/ user@<worker_CX7_IP>:./deepseek-v4-flash/
 ```
 
-### 3. Build Docker Image
+### 3. Pull Docker Image
 
-The solution combines two projects:
-- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) - DGX Spark Docker infrastructure (NCCL, PyTorch, FlashInfer, Ray)
-- [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120) - Triton-rewritten kernels for SM120+ (sparse MLA, FP8 einsum, paged MQA)
+The mixed backend patches are baked into the pre-built image. No source compilation needed:
 
 ```bash
-git clone https://github.com/eugr/spark-vllm-docker.git
-cd spark-vllm-docker
+docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
 ```
 
-Modify Dockerfile line 190 — change the vLLM clone URL:
+Pull on both nodes. Or pull on head and transfer via CX7: `docker save | ssh worker docker load`.
 
-```diff
-- git clone --recursive https://github.com/vllm-project/vllm.git
-+ git clone --recursive https://github.com/jasl/vllm.git
-```
-
-Build and sync to worker:
-
-```bash
-./build-and-copy.sh -t vllm-node-jasl -c <worker_CX7_IP> --vllm-ref ds4-sm120
-```
-
-~30 minutes compile + ~1 minute sync.
+> **Want to build from source?** First build the base image using [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) + [jasl/vllm ds4-sm120](https://github.com/jasl/vllm/tree/ds4-sm120) (~30 min), then apply patches via `Dockerfile.marlin-fix` in this repo. See [DevHistory.md](DevHistory.md) for details.
 
 ### 4. Start Inference
 
 ```bash
+cd /path/to/spark-vllm-docker
+
 HF_HOME=/path/to/weights/parent \
 VLLM_SPARK_EXTRA_DOCKER_ARGS="\
   -e TRANSFORMERS_OFFLINE=1 \
   -e HF_HUB_OFFLINE=1 \
   -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
 " \
-./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl-marlin-fix exec \
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t lmxxf/vllm-deepseek-v4-dgx-spark exec \
   vllm serve /root/.cache/huggingface/deepseek-v4-flash \
   --tensor-parallel-size 2 \
   --distributed-executor-backend ray \
