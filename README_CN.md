@@ -166,7 +166,7 @@ DeepSeek V4 Flash 采用 CSA + HCA 混合注意力架构，KV cache 极小——
 
 Marlin 的 FP4 MoE kernel 在 SM120+ 上有数据布局 bug（`ldmatrix` 指令行为和 SM80/90 不同）。每一层引入的误差很小，前 42 层都可容忍。但到第 42 层（最后一个 MoE 层），累积误差污染了 logits，输出变成垃圾。
 
-修复方法：0-41 层走 Marlin（快，单层误差可接受），第 42 层回退到 DeepGEMM（Consumer-DeepGEMM 的 Triton `tl.dot_scaled` kernel，正确但稍慢）。这个发现来自系统性的按层二分测试。
+修复方法：0-41 层走 Marlin（快，单层误差可接受），第 42 层回退到 DeepGEMM（[Consumer-DeepGEMM](https://github.com/lmxxf/Consumer-DeepGEMM) 的 Triton `tl.dot_scaled` kernel，正确但稍慢）。这个发现来自系统性的按层二分测试。
 
 `VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS` 支持逗号分隔的层号或半开区间（如 `42`、`40:43`、`0,42`）。
 
