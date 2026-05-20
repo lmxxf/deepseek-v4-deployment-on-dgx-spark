@@ -4,12 +4,13 @@
 
 Run **DeepSeek V4 Flash (280B, FP4)** on two **NVIDIA DGX Spark** nodes (128GB x2) connected via ConnectX-7 200Gbps RDMA.
 
-## Current Status (2026-05-11)
+## Current Status (2026-05-21)
 
 | Scenario | Status | Speed |
 |----------|--------|-------|
-| Chinese Q&A / writing / code | **Perfect** | **~12 tok/s** |
-| English Q&A / code | **Perfect** | **~12 tok/s** |
+| TP=2, Chinese Q&A / writing / code | **Perfect** | **~12 tok/s** |
+| TP=2, English Q&A / code | **Perfect** | **~12 tok/s** |
+| PP=2, Chinese / English / code | **Works** | **~10-11 tok/s** |
 
 Uses a **mixed backend** approach: 42 layers run Marlin (fast), the last MoE layer falls back to DeepGEMM via [Consumer-DeepGEMM](https://github.com/lmxxf/Consumer-DeepGEMM) (correct). This avoids Marlin's accumulated numerical error that corrupts English output at the final layer, while keeping 85% of Marlin's speed.
 
@@ -21,7 +22,22 @@ Built on [jasl/vllm](https://github.com/jasl/vllm/tree/ds4-sm120) fork with Trit
 docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest
 ```
 
-Based on jasl/vllm `ds4-sm120` + mixed backend patches (2026-05-11). Skip to [Step 4](#4-start-inference), replace `-t vllm-node-jasl-marlin-fix` with `-t lmxxf/vllm-deepseek-v4-dgx-spark`.
+Based on jasl/vllm `ds4-sm120` + mixed backend patches (2026-05-11). Skip to [Step 4](#4-start-inference) and use `-t lmxxf/vllm-deepseek-v4-dgx-spark`.
+
+For the optional PP=2 mode, build a tiny derived image from the uploaded image. This only replaces `mxfp4.py` so the layer-42 DeepGEMM fallback also matches PP layer names:
+
+```bash
+./scripts/build-pp-fix-image.sh --pull
+```
+
+This creates `vllm-deepseek-v4-pp-fix:latest`. To push it:
+
+```bash
+./scripts/build-pp-fix-image.sh \
+  --base lmxxf/vllm-deepseek-v4-dgx-spark:latest \
+  -t lmxxf/vllm-deepseek-v4-pp-fix:latest \
+  --push
+```
 
 ## Hardware Requirements
 
@@ -76,6 +92,8 @@ Pull on both nodes. Or pull on head and transfer via CX7: `docker save | ssh wor
 
 ### 4. Start Inference
 
+#### Recommended: TP=2 mixed backend
+
 ```bash
 cd /path/to/spark-vllm-docker
 
@@ -110,10 +128,62 @@ Using 'MARLIN' Mxfp4 MoE backend.
 MXFP4 layer 42 forced to DEEPGEMM_MXFP4 by VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
 ```
 
+#### Optional: PP=2 pipeline parallel
+
+PP=2 is verified to work, but for single-request generation it is slower than TP=2 (~10-11 tok/s vs ~12 tok/s). Use it as a pipeline-parallel baseline or for future concurrency testing, not as the default fastest mode.
+
+It requires the PP fix image:
+
+```bash
+cd /path/to/deepseek-v4-flash-deployment
+./scripts/build-pp-fix-image.sh --pull
+```
+
+Start with TP disabled and PP enabled:
+
+```bash
+cd /path/to/spark-vllm-docker
+
+HF_HOME=/path/to/weights/parent \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="\
+  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HUB_OFFLINE=1 \
+  -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
+  -e VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 \
+" \
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-deepseek-v4-pp-fix exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 4096 \
+  --enforce-eager \
+  --moe-backend marlin
+```
+
+PP-specific requirements:
+- `vllm-deepseek-v4-pp-fix`: Derived image that fixes layer-name parsing in `mxfp4.py`; without it, layer 42 fallback may not match and output can become corrupted
+- `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`: Required for stable PP execution; the default Ray compiled-graph PP path can hang on the second request
+- `--tensor-parallel-size 1 --pipeline-parallel-size 2`: Split layers across the two nodes instead of splitting tensors inside every layer
+
+Expected PP=2 steady-state speed:
+
+| Test | Output | Speed |
+|------|--------|-------|
+| `17 * 23 = ?` | `391` | sub-second after warmup |
+| Chinese writing | Correct | ~10-11 tok/s |
+| English code / quicksort | Correct | ~10-11 tok/s |
+
 ### 5. Stop
 
 ```bash
-./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-node-jasl-marlin-fix stop
+# TP=2 image
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t lmxxf/vllm-deepseek-v4-dgx-spark stop
+
+# PP=2 image
+./launch-cluster.sh -n <head_IP>,<worker_IP> -t vllm-deepseek-v4-pp-fix stop
 ```
 
 Must run `stop` before restarting — otherwise the worker node's container keeps running.
@@ -195,6 +265,8 @@ Client -> head:8000 (vLLM API)
 | **FlashInfer** | Optimized attention kernels |
 | **TileLang** | Hyperconnection kernel replacement for SM120 |
 
+For PP=2, the model is split by layer instead of tensor shard: rank0 owns the first 22 layers and rank1 owns the remaining 21 layers. This reduces per-layer all-reduce traffic, but single-request decode has pipeline bubbles, so TP=2 is still faster for interactive use.
+
 ## Key Technical Challenges
 
 | Problem | Solution |
@@ -205,6 +277,8 @@ Client -> head:8000 (vLLM API)
 | PR #40082 (FlashInfer b12x) doesn't help V4 | b12x only registered in NVFP4 oracle; V4 uses MXFP4 |
 | English output garbage (full Marlin) | Layer-by-layer bisection found error accumulates across all 43 layers; falling back only the last layer fixes it |
 | TP padding source offset bug | Fixed in patched `layer.py` — checkpoint source offset now uses unpadded shard size |
+| PP=2 second request hangs | Use `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1` instead of the default Ray compiled-graph PP path |
+| PP=2 output corruption | Use `vllm-deepseek-v4-pp-fix`; it lets the layer-42 fallback match PP layer names |
 
 ## Solution Comparison
 
@@ -214,6 +288,7 @@ Client -> head:8000 (vLLM API)
 | jasl/vllm fork (pure Marlin) | Correct | Garbage | 14 tok/s | Chinese only |
 | Consumer-DeepGEMM (all layers) | Correct | Correct | 4.1 tok/s | Correct but slow |
 | **Mixed backend (recommended)** | **Correct** | **Correct** | **12 tok/s** | **Best available** |
+| Mixed backend + PP=2 | Correct | Correct | 10-11 tok/s | Works; useful PP baseline |
 
 ## Troubleshooting
 

@@ -109,6 +109,47 @@ cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
 
 **不要 ctrl-c**——只杀 host 进程，slave 容器还在跑。必须用 stop。
 
+## 实验：流水线并行 PP=2
+
+PP=2 已验证可用，但单请求长输出不比 TP=2 快。必要条件：
+
+- 使用包含 `_layer_index_from_name()` 修复的镜像：`vllm-deepseek-v4-pp-fix:latest`
+- 使用 RayExecutorV2：`VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`
+- 保留最后一层回退：`VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42`
+
+启动：
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="\
+  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HUB_OFFLINE=1 \
+  -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
+  -e VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 \
+" \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-deepseek-v4-pp-fix exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 4096 \
+  --enforce-eager \
+  --moe-backend marlin
+```
+
+停止：
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-deepseek-v4-pp-fix stop
+```
+
+不要使用默认 Ray compiled graph PP 路径；它会在第二个请求卡住。
+
 ## 聊天网页（Open WebUI）
 
 ```bash

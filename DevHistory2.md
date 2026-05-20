@@ -790,3 +790,215 @@ MXFP4 layer 42 forced to DEEPGEMM_MXFP4 by VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
 ```
 
 结论：正式变量路径与之前 `VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42` 的正确性一致，可以作为当前默认推荐方案。
+
+### 已完成追加调研 16：TP=1 + PP=2 试跑
+
+目标：验证双机是否可以从张量并行改成流水线并行，减少跨机每层 all-reduce 通信。
+
+启动参数：
+
+```text
+--tensor-parallel-size 1
+--pipeline-parallel-size 2
+--distributed-executor-backend ray
+--gpu-memory-utilization 0.80
+--kv-cache-dtype fp8
+--max-model-len 4096
+--enforce-eager
+--moe-backend marlin
+VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
+```
+
+确认项：
+
+- vLLM 正确接收 `tensor_parallel_size=1, pipeline_parallel_size=2`。
+- Ray rank 分配正确：
+  - rank0: `PP rank 0, TP rank 0`
+  - rank1: `PP rank 1, TP rank 0`
+- DeepSeek V4 模型类支持 PP：`DeepseekV4ForCausalLM(nn.Module, SupportsPP)`，内部用 `make_layers()` 切层。
+- 层被切成 `[22,21]`，日志提示可用 `VLLM_PP_LAYER_PARTITION` 手工覆盖。
+- safetensors 加载成功，4k 场景没有卡在旧 true-Marlin 131k 的 `30/46` 附近。
+
+加载结果：
+
+| rank | model memory | KV cache memory |
+|---|---:|---:|
+| PP rank 0 | 74.81 GiB | 22.9 GiB |
+| PP rank 1 | 71.33 GiB | 23.56 GiB |
+
+这个结果后来确认是合理的：`TP=2` 是 43 层都在、每层权重横切一半；`PP=2 + TP=1` 是每台只放约一半层、但每层权重完整。因此两者每台常驻权重都约等于半个模型，显存接近 `73 GiB/rank` 不代表 PP 切层失败。
+
+请求测试：
+
+| 测试 | 结果 |
+|---|---|
+| 第一次 `17 * 23 = ?`，`max_tokens=50` | 返回 HTTP 200，内容连贯，但 50 token 截断在公式中；端到端 33.98s，日志中生成吞吐约 3 tok/s，主要受首次 Ray graph / TileLang 编译影响 |
+| 第二次 `17 * 23 = ? 只回答结果。`，`max_tokens=80` | 超过 90s 未返回，`/health` 3s 内无响应，两个 RayWorker 持续高 CPU；判定 PP 请求路径存在卡死/长阻塞风险 |
+
+结论：
+
+- **TP=1 + PP=2 当前不能作为可用部署方案。**
+- 它能启动、能加载、首个请求能返回，说明基础 PP 支持不是空的。
+- 但第二请求卡死，且吞吐低于当前 TP=2 混合后端方案，当前默认仍应保持：
+
+```text
+--tensor-parallel-size 2
+--pipeline-parallel-size 1
+--moe-backend marlin
+VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
+```
+
+下一步如果继续追 PP，应优先查 Ray compiled graph + PP communicator 的请求复用路径，而不是继续调 MoE kernel。关键日志：
+
+```text
+Using RayPPCommunicator (which wraps vLLM _PP GroupCoordinator) for Ray Compiled Graph communication.
+RAY_CGRAPH_get_timeout is set to 300
+```
+
+可尝试方向：
+
+1. 关闭 Ray compiled DAG / PP compiled graph 相关路径，验证是否是 communicator 复用死锁。
+2. 设置 `VLLM_PP_LAYER_PARTITION=21,22`，把最后 layer42 放在 PP rank1 的位置保持不变，但验证不均衡分区是否影响。
+3. 增加 PP/Ray debug 日志，定位第二请求卡在 prefill、decode、stage handoff 还是 sampling。
+
+### 已完成追加调研 17：PP=2 可用修复
+
+继续追 PP 后确认有两个独立问题：
+
+1. 默认 Ray executor 走 Ray compiled graph + RayPPCommunicator，第二请求会卡住。
+2. 切到 RayExecutorV2 后不再卡住，但最初输出乱码，因为 layer42 回退没有在 PP 路径中确认命中。
+
+#### 修复 1：改用 RayExecutorV2
+
+新增启动环境变量：
+
+```text
+VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1
+```
+
+生效特征：
+
+```text
+Asynchronous scheduling is enabled.
+RayWorkerProc / Worker_PP0 / Worker_PP1
+```
+
+未加这个变量时，日志会走：
+
+```text
+Using RayPPCommunicator (which wraps vLLM _PP GroupCoordinator) for Ray Compiled Graph communication.
+```
+
+这个路径会在第二个请求卡住。加 `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1` 后，连续请求不再卡死。
+
+#### 修复 2：放宽 layer index 解析
+
+改动文件：
+
+```text
+spark-vllm-docker/vllm-sm120/vllm-sm120/vllm/model_executor/layers/quantization/mxfp4.py
+```
+
+`_layer_index_from_name()` 从只匹配：
+
+```text
+\.layers\.(\d+)\.ffn\.experts$
+```
+
+放宽为：
+
+```text
+(?:^|\.)layers\.(\d+)\.ffn(?:\.experts)?$
+```
+
+同时加了一个默认关闭的调试开关：
+
+```text
+VLLM_MXFP4_DEBUG_LAYER_NAMES=1
+```
+
+用于打印：
+
+```text
+MXFP4 layer backend check layer_name='model.layers.42.ffn.experts' layer_idx=42 backend=MARLIN force_deepgemm='42'
+```
+
+实测确认 PP rank1 命中最后一层回退：
+
+```text
+MXFP4 layer 42 forced to DEEPGEMM_MXFP4 by VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
+```
+
+#### 临时镜像
+
+基于 Docker Hub 镜像覆盖单个 Python 文件：
+
+```text
+spark-vllm-docker/Dockerfile.pp-fix
+```
+
+已在 host 和 slave 都构建/加载：
+
+```text
+vllm-deepseek-v4-pp-fix:latest
+```
+
+构建/同步命令：
+
+```bash
+docker build -f Dockerfile.pp-fix -t vllm-deepseek-v4-pp-fix:latest .
+docker save vllm-deepseek-v4-pp-fix:latest | ssh lmxxf@169.254.30.81 "docker load"
+```
+
+#### 推荐 PP=2 启动命令
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS="\
+  -e TRANSFORMERS_OFFLINE=1 \
+  -e HF_HUB_OFFLINE=1 \
+  -e VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42 \
+  -e VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1 \
+" \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-deepseek-v4-pp-fix exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 1 \
+  --pipeline-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 4096 \
+  --enforce-eager \
+  --moe-backend marlin
+```
+
+#### 验证结果
+
+无 debug 环境变量下最终复测：
+
+| 测试 | 结果 | 耗时 |
+|---|---|---:|
+| 第一次 `17 * 23 = ? 只回答结果。` | `391` | 28.39s（首次 warmup） |
+| 第二次同 prompt | `391` | 0.34s |
+| 第三次同 prompt | `391` | 0.34s |
+| Python `sum_even(nums)` | 正确代码 | 正常 |
+
+扩展样本：
+
+| Prompt | 结果 | 耗时 |
+|---|---|---:|
+| 英文 quicksort，180 tokens | 正常英文和代码片段 | 15.38s |
+| 中文长城，131 tokens | 正常中文 | 11.44s |
+| Python `sum_even` | 正常 | 3.24s |
+| 苹果推理题 | `5` | 0.76s |
+
+结论：
+
+- **PP=2 路线已从“能加载但会卡/会乱码”修到“可用”。**
+- 必要条件是：
+  - `VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1`
+  - `VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42`
+  - 使用包含 `_layer_index_from_name()` 修复的镜像/源码
+- 性能上，PP=2 单请求长输出不比 TP=2 快，主要因为流水线气泡和 stage handoff；但它已经可以作为后续 PP 调优基线。
