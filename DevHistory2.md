@@ -929,25 +929,36 @@ MXFP4 layer backend check layer_name='model.layers.42.ffn.experts' layer_idx=42 
 MXFP4 layer 42 forced to DEEPGEMM_MXFP4 by VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42
 ```
 
-#### 临时镜像
+#### PP 修复镜像
 
-基于 Docker Hub 镜像覆盖单个 Python 文件：
+基于 Docker Hub 镜像生成一个很小的派生镜像，只修补容器内：
 
 ```text
-spark-vllm-docker/Dockerfile.pp-fix
+/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/mxfp4.py
 ```
 
-已在 host 和 slave 都构建/加载：
+补丁入口已经放到主仓库，避免藏在被 `.gitignore` 忽略的 `spark-vllm-docker/` 子目录里：
+
+```text
+scripts/build-pp-fix-image.sh
+```
+
+构建命令：
+
+```bash
+./scripts/build-pp-fix-image.sh --pull
+```
+
+输出镜像：
 
 ```text
 vllm-deepseek-v4-pp-fix:latest
 ```
 
-构建/同步命令：
+如需同步到 slave：
 
 ```bash
-docker build -f Dockerfile.pp-fix -t vllm-deepseek-v4-pp-fix:latest .
-docker save vllm-deepseek-v4-pp-fix:latest | ssh lmxxf@169.254.30.81 "docker load"
+./scripts/build-pp-fix-image.sh --copy-to 169.254.30.81
 ```
 
 #### 推荐 PP=2 启动命令
@@ -1002,3 +1013,34 @@ VLLM_SPARK_EXTRA_DOCKER_ARGS="\
   - `VLLM_MXFP4_MARLIN_DEEPGEMM_LAYERS=42`
   - 使用包含 `_layer_index_from_name()` 修复的镜像/源码
 - 性能上，PP=2 单请求长输出不比 TP=2 快，主要因为流水线气泡和 stage handoff；但它已经可以作为后续 PP 调优基线。
+
+#### 追加判断：为什么 PP 在 DGX Spark 上没赚到
+
+这次 PP=2 的负收益不是简单一句“网络慢”能解释。更准确的判断：
+
+- PP 主要减少的是跨机器网线通信。
+- TP=2 每层 all-reduce 确实要走 CX7/RoCE。
+- 但 DGX Spark 的本地统一内存本身就慢，远不是 H100/H200 那种 HBM 带宽。
+- 在这个平台上，很多时间本来就在等本地内存把权重喂给计算单元。
+- 因此 CX7/RoCE 虽然慢，但相对 DGX Spark 的本地内存瓶颈，没有慢到完全主导。
+- PP 省下的网线通信，不够抵消单请求 decode 的 stage 串行和 pipeline bubble。
+
+更一般的判断：
+
+```text
+PP 只有在“网络瓶颈远大于本地内存瓶颈”时才更可能明显收益。
+```
+
+例如多台家用机器/Mac 通过 USB 或普通以太网拼起来做推理时，网络可能比本地统一内存慢很多；那种场景下 TP 每层 all-reduce 会被低速链路拖死，PP 少通信才可能更有意义。
+
+但双 DGX Spark + CX7/RoCE 不是这个形态。这里是“网线虽慢，内存更慢”，所以 PP 没有超过 TP。
+
+#### 追加判断：PP 的定位
+
+PP=2 不应写成生产推荐方案。生产级在线推理如果有足够多的数据中心 GPU 和高速互联，通常更倾向 TP/EP/DP 等组合来换吞吐、并发和集群利用率。PP 在大模型训练里常见，但在在线单请求 decode 场景里容易被流水线气泡拖住。
+
+本次测试 PP 的意义是家用/桌面大内存机器语境下的工程基线：
+
+- DGX Spark 这类机器容量大，但内存带宽和互联不是生产 H100 集群形态。
+- 家用电脑、多台桌面机器、Mac 等场景经常不是追求最优部署，而是先解决“模型能不能拆开塞进去”。
+- 在这种语境下 PP 值得验证；但当前双 Spark 单请求推理仍应默认使用 TP=2 mixed backend。
