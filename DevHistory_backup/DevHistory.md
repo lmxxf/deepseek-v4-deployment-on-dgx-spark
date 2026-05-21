@@ -1,0 +1,2588 @@
+# DeepSeek V4 Flash 双机部署踩坑记录
+
+两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 跑 DeepSeek V4 Flash (280B, 158GB FP4)。
+
+---
+
+## 第一阶段：下载权重
+
+### 问题1：hf_transfer 在国内网络翻车
+- `huggingface-cli download` 默认开了 `hf_transfer` 多线程并行下载
+- 国内翻墙网络扛不住多线程，10MB/s 跑到 2% 就断
+- **解法**：关掉 hf_transfer（`unset HF_HUB_ENABLE_HF_TRANSFER`），单线程老老实实下
+- 1.4MB/s 跑了一晚上，160G 下完
+
+### 问题2：下载中断
+- 下到 42/46 文件时连接断了
+- **解法**：重跑同样的命令，已下完的自动跳过，只续传剩余文件
+
+### 问题3：国内镜像
+- hf-mirror.com 是公益镜像，`export HF_ENDPOINT=https://hf-mirror.com` 即可
+- 不走梯子，国内带宽直接下
+
+---
+
+## 第二阶段：双机组网
+
+### 硬件连接
+- 两台 Spark 通过 QSFP56 DAC 线缆直连 ConnectX-7 网卡
+- 200Gbps 点对点，不需要交换机（交换机是给 3 台以上用的）
+- host (spark-3a10): 192.168.31.198 / CX7: 169.254.248.35
+- slave (spark-e8bb): 192.168.31.172 / CX7: 169.254.30.81
+
+### 配置步骤
+1. `netplan` 配网（两台都执行，官方 playbook 脚本）
+2. `discover-sparks` 自动发现 + SSH 免密
+3. 互 ping 验证
+
+### 关键认知：256GB 不是"统一内存"
+- NVIDIA 宣传"256GB 共享内存"是营销话术
+- 实际是**两台独立机器通过 RDMA 网络组成的分布式集群**
+- 每台有自己独立的 128GB，通过 NCCL 做 GPU 间通信
+- 不像 Mac 的统一内存那样对应用透明
+- 两台机器**各需要一份模型权重**
+
+### 权重同步
+- rsync 走 CX7 200Gbps：581MB/s，160G 不到五分钟
+- `rsync -avP` 从 host 到 slave
+
+---
+
+## 第三阶段：推理框架选型
+
+### 方案1：手动编译 NCCL（放弃）
+- 官方 playbook 要求两台都手动编译 NCCL + nccl-tests
+- 步骤繁琐：装 libopenmpi-dev → 编译 NCCL（sm_121）→ 设环境变量 → 编译测试套件 → 跑通信测试
+- 对比 Mac 一条命令跑模型，这条路太蛋疼
+
+### 方案2：mark-ramsey-ri/vllm-dgx-spark 脚本（采用）
+- Docker 容器方案，NCCL/Ray/vLLM 全打包在 NGC 容器里
+- 一键 `./start_cluster.sh` 启动 Ray 集群 + vLLM 推理服务
+- host 跑 Ray Head + vLLM API (port 8000)，slave 跑 Ray Worker
+
+### 架构理解
+- **Ray = 调度员**：管进程启停、资源分配、任务编排
+- **NCCL = 对讲机**：管 GPU 之间的张量传输（AllReduce）
+- **Tensor Parallel**：每一层的矩阵乘法被水平切分，两台同时算，每层通过 NCCL 同步
+- 200Gbps CX7 vs 同机 NVLink 900Gbps：带宽差 4.5 倍，但 MoE 模型通信量小
+
+---
+
+## 第四阶段：踩坑大全
+
+### 坑1：HuggingFace cache 格式不匹配
+- 权重直接下载到 `deepseek-v4-flash/` 目录
+- vllm-dgx-spark 脚本用 `snapshot_download(local_files_only=True)` 验证模型
+- 这个函数要求 HF cache 格式：`hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/<hash>/`
+- **解法**：直接改脚本，把 `snapshot_download` 验证替换成 `test -f config.json`
+- 两个脚本都要改：`start_cluster.sh`（host）和 `start_worker_vllm.sh`（worker）
+
+### 坑2：vLLM serve 路径问题
+- Docker 容器把 `${HF_CACHE}` 挂载到 `/root/.cache/huggingface`
+- 配置里 MODEL 用 HF 模型名 `deepseek-ai/DeepSeek-V4-Flash`，容器内离线模式找不到
+- **解法**：把 `vllm serve` 命令里的 MODEL 硬改成容器内路径 `/root/.cache/huggingface/deepseek-v4-flash`
+
+### 坑3：slave Docker 权限
+- SSH 到 slave 启动 worker 时报 `permission denied while trying to connect to docker API`
+- **解法**：`sudo usermod -aG docker lmxxf`，重新登录生效
+
+### 坑4：vLLM 26.03 不认识 DeepSeek V4
+- NGC 容器 `nvcr.io/nvidia/vllm:26.03-py3` 是 2026 年 3 月的
+- DeepSeek V4 是 2026-04-24 发布的，容器里的 transformers 4.57.5 不认识 `deepseek_v4` 架构
+- **解法**：在容器里 `pip install --upgrade transformers vllm`
+- transformers 4.57.5 → 5.6.2，vLLM 0.17.1 → 0.20.0
+
+### 坑5：start_cluster.sh 每次重建容器
+- 脚本每次启动都删除旧容器、创建新容器
+- 之前在容器里 pip 升级的全丢了
+- **解法**：`docker commit` 保存升级后的容器为新镜像 `nvcr.io/nvidia/vllm:26.03-py3-dsv4`
+- `docker save | ssh ... docker load` 走 CX7 传到 slave
+
+### 坑6：脚本每次 docker pull 远程
+- 新镜像名在远程 registry 不存在，pull 报错
+- **解法**：改脚本 pull 逻辑，先 `docker image inspect` 检查本地有没有，有就跳过
+
+### 坑7：worker 脚本用了旧镜像名
+- `start_cluster.sh` 配置了新镜像名，但没传给 worker 脚本
+- `start_worker_vllm.sh` 里 IMAGE 默认值写死了 `nvcr.io/nvidia/vllm:26.03-py3`
+- **解法**：在 WORKER_ENV 里加上 `IMAGE=${IMAGE}`
+
+### 坑8：flashinfer 版本不匹配
+- 容器里 flashinfer-jit-cache 是 0.6.7，pip 升级装了 flashinfer 0.6.8
+- **解法**：加环境变量 `FLASHINFER_DISABLE_VERSION_CHECK=1`
+
+### 坑9：--swap-space 参数被移除
+- vLLM 0.20.0 移除了 `--swap-space` 参数
+- **解法**：从脚本里注释掉这个参数
+
+### 坑10：GPU 显存不足
+- `gpu_memory_utilization=0.9` 要求 109.52GB，但可用只有 106.1GB
+- 128GB 统一内存里有一部分被系统占了
+- **解法**：降到 0.85
+
+### 坑11：kv-cache 格式
+- DeepSeek V4 只支持 fp8 kv-cache，默认 `auto` 报错
+- **解法**：加参数 `--kv-cache-dtype fp8`
+
+### 坑12：PyTorch inductor 编译器冲突（致命）
+- pip 升级 vllm 0.20.0 时连带把 torch 从 NGC 定制版换成了社区版
+- NGC 的 torch 针对 ARM64 + Blackwell sm_121 做过深度定制
+- 社区版 torch 2.11.0 的 inductor 编译器和 NGC 容器里的其他组件不兼容
+- `AssertionError: auto_functionalized was not removed` — torch inductor 内部 bug
+- **结论**：在 NGC 26.03 容器里 pip 升级这条路走不通
+
+---
+
+## 第五阶段：换方案
+
+### eugr/spark-vllm-docker（构建成功，运行失败）
+- 社区专门给 DGX Spark 做的 Docker 构建方案
+- 从源码编译 vLLM 0.20.1rc1，针对 ARM64 + Blackwell sm_121 优化
+- 有 Transformers v5 版本（`vllm-node-tf5`），支持 DeepSeek V4
+- `./build-and-copy.sh -t vllm-node-tf5 -c` 构建成功，17 分钟，自动复制到 slave
+- Dockerfile 修改：nccl 和 DeepGEMM 都改成宿主机预先 clone + COPY（Docker 内访问不了 GitHub）
+
+### 坑13：DeepGEMM 缺失
+- vLLM 的 Sparse Attention Indexer 需要 DeepGEMM 库
+- eugr 镜像默认不含 DeepGEMM
+- **解法**：在 Dockerfile 里加 `COPY deepgemm-src/ + pip install`
+- 注意 git submodule（cutlass）也要一起 clone
+
+### 坑14：torch inductor `auto_functionalized` 错误（再次）
+- DeepGEMM 安装成功后，`--enforce-eager` 模式绕过 torch.compile
+- 但仍然在 dummy_run 阶段触发 inductor 编译路径
+
+### 坑15：DeepGEMM hyperconnection 不支持 sm_121（致命）
+- `RuntimeError: Assertion error (csrc/apis/hyperconnection.hpp:56): Unsupported architecture`
+- DeepGEMM 的 `tf32_hc_prenorm_gemm` kernel 硬编码了架构检查
+- 只支持数据中心级 Blackwell (sm_100) 和 Hopper (sm_90)
+- DGX Spark 的 GB10 是 sm_121（桌面级 Blackwell），不在支持列表
+- 环境变量（`VLLM_USE_DEEP_GEMM=0` 等）无法绕过——hyperconnection 是独立的代码路径
+- 论坛上有人用 Triton kernel 补丁成功，但补丁和 eugr 镜像的 vLLM 版本不兼容
+
+### 坑16：jasl/vllm fork 补丁版本不匹配
+- jasl 的 `ds4-sm120` 分支专门做了 sm_120 系列支持
+- 尝试用 `-v` 挂载替换个别 .py 文件到 eugr 容器
+- 失败：`ImportError: cannot import name 'dequantize_combined_sparse_mla_decode_kv'`
+- 两个版本的 vllm 内部 API 不兼容，部分替换行不通
+
+### 坑17：jasl fork 从源码编译的坑
+- 改 eugr Dockerfile 把预编译 whl 换成 jasl 源码编译
+- Docker 不跟软链——`ln -s` 不行，必须 `cp -r`
+- 缺 `setuptools_scm`、`pybind11`、`cmake`——逐个加
+- `setuptools` 版本冲突——torch 要 `<82`，vllm 要 `<81`，新 pyproject.toml 要 `>=75`
+- requirements.txt 里的 hash 锁定——直接 `sed` 删掉所有 `--hash` 行
+- 每次编译约 1 小时，共编译 4 次
+
+### 坑18：CUDA 架构不匹配（最后一个坑）
+- 编译成功，hyperconnection Triton fallback 生效——不再报 `Unsupported architecture`
+- 但运行时 `CUDA error: no kernel image is available for execution on the device`
+- 根因：容器里的 torch 2.11.0（PyPI 社区版）只支持到 sm_120，不包含 sm_121
+- DGX Spark GPU 实际是 sm_121 (Capability 12.1)
+- **解法**：vLLM C++ 扩展编译时用 `TORCH_CUDA_ARCH_LIST="12.0"` + `CMAKE_CUDA_ARCHITECTURES="120-real"`
+- sm_120 的 kernel 在 sm_121 上前向兼容——sm_121 是 sm_120 的超集
+- 重新编译一次，43 分钟，**跑通了**
+
+### ✅ 最终成功（2026-04-29）
+- 首次请求返回：*"你好，我是DeepSeek，一个由深度求索公司打造的AI助手，乐于为你解答问题、提供信息与创意灵感。"*
+- 从 4-28 晚开始到 4-29 下午出字，约 48 小时
+- 核心方案：eugr 基础设施 + jasl sm_120 fork 源码编译 + sm_120 前向兼容
+- 镜像名：`vllm-node-sm120`
+
+---
+
+## 第六阶段：Docker 构建中的代理坑
+
+### Docker 代理配置
+- Docker build 容器内通过 `~/.docker/config.json` 配代理
+- `127.0.0.1` 在容器内不可达，必须用宿主机 IP（`192.168.31.198`）
+- `noProxy` 要排除不需要翻墙的域名：`*.ubuntu.com`、`*.nvidia.com`、`*.nvidia.cn`、`*.pypi.org`、`*.pythonhosted.org`、`*.pytorch.org`、`download-r2.pytorch.org`
+- 最终方案：**去掉 Docker 代理**，GitHub 相关的在宿主机预先 clone 好 COPY 进去
+- ShellCrash 的 Redir 模式（iptables 透明代理）让宿主机不需要设 proxy 环境变量就能访问 GitHub，但 Docker build 的网络是隔离的不走 iptables
+
+---
+
+## 日常运维命令速查
+
+### 启动推理服务
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+./launch-cluster.sh -t vllm-node-sm120 exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 1000000 \
+  --enforce-eager
+```
+
+### 停止推理服务
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+./launch-cluster.sh -t vllm-node-sm120 stop
+```
+
+**不要 ctrl-c**——只杀 host 进程，slave 容器还在跑。必须用 stop。
+
+### 启动聊天网页（Open WebUI）
+
+```bash
+docker start open-webui
+```
+
+浏览器打开 http://192.168.31.198:3000 ，首次启动需要注册本地账号（不联网），注册后是管理员。
+
+如果是第一次安装 Open WebUI：
+
+```bash
+docker run -d --name open-webui \
+  -p 3000:8080 \
+  -e OPENAI_API_BASE_URL=http://192.168.31.198:8000/v1 \
+  -e OPENAI_API_KEY=none \
+  --restart unless-stopped \
+  ghcr.io/open-webui/open-webui:main
+```
+
+ARM64 上首次启动初始化数据库要好几分钟，耐心等。
+
+### 测试 API
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/root/.cache/huggingface/deepseek-v4-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "max_tokens": 100
+  }'
+```
+
+### 关键路径
+
+| 路径 | 内容 |
+|------|------|
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash/` | 模型权重（158GB，两台都有） |
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker/` | eugr 构建工具 + 改过的 Dockerfile |
+| `/home/lmxxf/work/deepseek-v4-flash-deployment/vllm-sm120/` | jasl vllm ds4-sm120 源码 |
+
+### 网络地址
+
+| 节点 | WiFi IP | CX7 IP |
+|------|---------|--------|
+| host (spark-3a10) | 192.168.31.198 | 169.254.248.35 |
+| slave (spark-e8bb) | 192.168.31.172 | 169.254.30.81 |
+
+### 已开源
+
+- Docker Hub：`docker pull lmxxf/vllm-deepseek-v4-dgx-spark:latest`
+- GitHub：`https://github.com/lmxxf/deepseek-v4-deployment-on-dgx-spark`
+
+### 显存分配
+
+- 总可用：~206GB（两台各 103GB，0.85 利用率）
+- 模型权重：~148GB（每台 73.85GB）
+- KV cache：~58GB，V4 的 KV cache 仅传统模型 2%，1M 上下文只需约 5GB，绰绰有余
+
+---
+
+## 待解决：中间层激活值提取
+
+### 当前状态
+vLLM 是推理服务框架，不暴露中间层激活值。要做自我意识实验（dump 中间层激活、开灯/关灯对比等），需要在 forward 过程中 hook 中间层，vLLM 不支持。
+
+### 可能的方案（等生态成熟）
+
+1. **vLLM 加 hook 支持**——社区有需求，未来版本可能加 `--return-hidden-states`
+2. **SGLang**——已有 `return_hidden_states` 实验性支持，等它支持 sm_121 + V4
+3. **transformers + accelerate 双机**——等 accelerate 支持 CX7 RDMA，158GB 权重分两台各半加载，注册 forward hook
+4. **NGC 官方容器**——等 26.05/26.06 NGC 容器原生支持 V4 + sm_121，用 NGC 的 torch 加 hook
+
+### 临时方案（现在就能试，但慢）
+进 vLLM 容器，用 transformers `device_map="auto"` 加载到单机 128GB（CPU+GPU 混合放置），注册 forward hook 提取激活值。速度很慢但能拿到数据。
+
+---
+
+## 第七阶段：长输出垃圾问题排查（2026-05-02，未解决）
+
+### 现象
+短回复（<100 token）正常，长输出（>100 token）开头固定出垃圾（重复符号、多语言乱码），几十 token 后模型自己拉回来输出正常内容。
+
+### 排查过程
+
+1. **chat template 排查**：tokenizer_config.json 没有 chat_template 字段（V4 设计如此，用 `--tokenizer-mode deepseek_v4` 代替）
+2. **发现 `</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误在 prompt 末尾插入 `</think>`。已修复（`docker commit` 保存）
+3. **修复后仍然出垃圾**：prompt_tokens 从 14 降到 13（修复生效），但输出模式不变
+4. **tokenizer 验证**：`PreTrainedTokenizerFast` 直接编码特殊 token 完全正确（`<｜User｜>` → 128803 单 token）
+5. **completions 端点验证**：手动拼正确格式的 prompt 走 `/v1/completions`，也出垃圾——排除 chat template 问题
+6. **Docker Hub 原版镜像验证**：`lmxxf/vllm-deepseek-v4-dgx-spark` 同样出垃圾——bug 一直存在，前天短对话没暴露
+7. **权重文件验证**：46 shard、149GB，config 正常
+8. **两台镜像一致性验证**：image ID 完全相同
+
+### 根因确认 ✅
+
+**Marlin MXFP4 MoE kernel 在 SM120/SM121 上产生错误计算结果。** 这是已知问题（vllm#40928、cutlass#3096）。
+
+日志：`Using 'MARLIN' Mxfp4 MoE backend` — Marlin 的 NVFP4 kernel 没有原生 SM120 支持，PTX fallback 从 sm_80 JIT 提升到 sm_121，cubin 产生**静默错误**。
+
+### 排除过程
+
+| 尝试 | 结果 |
+|------|------|
+| `--kv-cache-dtype` 去掉 | ❌ V4 强制要求 fp8 KV cache |
+| `--max-model-len 8192` | 无改善 |
+| `--moe-backend triton` | ❌ Triton MoE 不支持 SM120 |
+| `--moe-backend emulation` | ❌ emulation 不支持 MXFP4 权重转换 |
+| `--moe-backend cutlass` | ❌ cutlass 不在 MXFP4 可选列表 |
+| `--moe-backend flashinfer_cutlass` | ❌ 不支持 SM120 量化格式 |
+| 清页缓存 + 降 gpu-memory-utilization | 无改善 |
+| 两台重启 | 无改善 |
+
+**结论：SM120 上只有 Marlin 能跑 FP4 MoE，但 Marlin 在 SM120 上算错。其他所有 backend 都不支持 SM120。**
+
+### 为什么前天看起来"正常"
+
+前天只测了短对话（"你好"，<100 token）。短回复时 MoE 专家激活少、误差小，输出碰巧能自洽。长输出（>100 token）误差累积就跑飞。
+
+### 速度基线（参考，输出含垃圾）
+- 短回复：33 tokens / 3.8s = ~8.7 tok/s（含 prefill）
+- 长输出（重复 token）：1000 tokens / 75.3s = ~13.3 tok/s
+- 长输出（混合垃圾+正常）：500 tokens / 54s = ~9.3 tok/s
+
+### 进一步排查：不是全坏，是部分坏（2026-05-02 晚）
+
+| Prompt | 结果 | tokens | finish |
+|--------|------|--------|--------|
+| "2+2" | ✅ 正确 "4" | 2 | stop |
+| "用200字介绍北京的历史" | ✅ 完美 | 135 | stop |
+| "1+1等于几" | ✅ 正确 | 33 | stop |
+| "写一个Python快速排序函数" | ❌ 垃圾 | 500 | length |
+| "唐朝著名诗人" | ❌ 垃圾 | 500 | length |
+| "What is quicksort" | ❌ 垃圾 | 500 | length |
+| "请用500字介绍万里长城" | ❌ 垃圾 | 600 | length |
+| "print hello world in python" | ❌ 垃圾 | 50 | length |
+| 加 system prompt | ❌ 垃圾 | 16 | length |
+
+**模式**：知识问答类 prompt 正常（模型自然生成 EOS 停止），代码类/长文类从第一个 token 开始跑飞（被 max_tokens 截断）。不同 prompt 激活不同的 MoE 专家组合，某些专家的 FP4 计算在 SM120 上是错的。
+
+**Marlin .so 确认编译了 sm_120 cubin**（不是 PTX fallback）——问题是 Marlin 的 FP4 mma.sync kernel 在 SM120 上计算结果错误，可能和 SM120 的 FP4 MMA 行为差异有关。
+
+**其他 MoE backend 排查**：
+- `--moe-backend triton`：不支持 SM120
+- `--moe-backend emulation`：权重转换不支持 / 反量化依赖 amd-quark / quant scheme 不匹配
+- `--moe-backend cutlass/flashinfer_cutlass`：不支持 MXFP4 或 SM120
+
+**另外修复了 `</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误插入 `</think>`。已在容器内修复。
+
+### vLLM 框架内修复尝试（全部失败）
+
+| 方案 | 结果 |
+|------|------|
+| `--moe-backend triton` | Triton MoE 不支持 SM120 设备 |
+| `--moe-backend emulation` (OCP) | 需要 amd-quark，quark 依赖 `torch.ao.quantization.pt2e`，容器 PyTorch 没有 |
+| `--moe-backend emulation` (Nvfp4) | `global_scale` 为 None，初始化路径不匹配 |
+| `--moe-backend cutlass` | 不在 MXFP4 可选列表 |
+| `--moe-backend flashinfer_cutlass` | 不支持 SM120 量化格式 |
+| 绕过 `_return_or_raise` 检查 | ✅ 生效但后续反量化函数缺依赖 |
+| 绕过 `convert_weight_to_mxfp4_moe_kernel_format` | ✅ 生效但后续 forward 缺依赖 |
+
+**结论：vLLM 框架内的所有 fallback 路径在 SM120 + 当前容器环境下都不可用。Marlin 是唯一能跑的 backend，但计算结果部分错误。**
+
+### 附加修复
+
+- **`</think>` bug**：`deepseek_v4_encoding.py` 第 403 行，chat 模式下错误插入 `</think>`。已修复（`docker commit`）
+- **`autodiscover` 超时**：`169.254.0.0/16` 网段 65534 个 IP 扫描超时，加 `-n` 参数手动指定节点解决
+
+### 解法方向
+
+1. **Consumer-DeepGEMM**（新项目）：用 CUTLASS SM120 模板实现正确的 FP4 MoE kernel，替换 Marlin——CUTLASS Example 79 有现成的 SM120 FP4 Grouped GEMM
+2. **替换 `dequant_mxfp4` 函数**：用实验平台验证过的 FP4 查表法重写反量化，不依赖 quark
+3. 等 vLLM 上游修复 Marlin SM120 支持
+4. 等 NVIDIA NGC 容器原生支持 V4 + SM121
+
+### Consumer-DeepGEMM 进展（2026-05-03）
+
+**主线确定：不再继续在 vLLM 里硬 patch Marlin/emulation，老老实实做 Consumer-DeepGEMM。**
+
+已完成：
+
+1. **Python fallback 正确性修正**
+   - `fp8_fp4_*` 不再把 packed FP4 权重当 FP8 解码
+   - 新增 E2M1 查表解包 + E8M0 block scale 反量化
+   - 这是正确性兜底路径，不追求速度
+
+2. **CUTLASS native extension 骨架**
+   - 新增 `consumer_deep_gemm._C`
+   - 默认安装不编 CUDA，避免普通环境卡死
+   - 设置 `CONSUMER_DEEP_GEMM_BUILD_CUDA=1` 才编 CUDA extension
+   - `scripts/build_native_sm120.sh` 自动设置：
+     - `CUDA_HOME=/usr/local/cuda`
+     - `CUTLASS_PATH=../DeepGEMM/third-party/cutlass`
+     - `CONSUMER_DEEP_GEMM_CUDA_ARCH=120a`
+   - 兼容容器里只有 `python3` 没有 `python` 的情况
+
+3. **Docker 编译验证通过**
+   - base conda 的 PyTorch 是 CPU/非 CUDA 链接环境，不能编 extension：缺 `libc10_cuda` / `libtorch_cuda`
+   - 正确编译环境是 `vllm-node-sm120:latest`
+   - 用临时容器挂载源码编译成功：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh'
+```
+
+验证命令：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  python3 -c "import consumer_deep_gemm as dg; print(dg.native_build_info())"
+```
+
+输出：
+
+```text
+{'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+```
+
+**当前状态：编译链路打通，但还没接真实 GEMM。**  
+现在 `_C` 里只有 CUTLASS SM120/SM121 探针，证明 CUDA 13.2 + PyTorch 2.11.0+cu130 + CUTLASS + aarch64 编译链路可用。真正的 `m_grouped_fp8_fp4_gemm_nt_contiguous` 还没从 CUTLASS Example 79d 拆出来。
+
+**2026-05-03 追加：grouped fallback 语义修正**
+
+- 修复 `Consumer-DeepGEMM/consumer_deep_gemm/gemm.py`：
+  - `m_grouped_fp8_fp4_gemm_nt_contiguous` 不再把真实 MoE grouped B 当普通 2D GEMM 处理
+  - 新增 per-row `m_indices` 分组路径，支持 `-1` padding 行清零
+  - grouped B 反量化后按 group 选择对应专家权重，逐组执行 `A_group @ B_group.T`
+  - 对 B 的 `[G, N, K]` / `[G, K, N]` 两种布局做最小推断
+- 新增测试：`tests/test_fp4_fallback.py::test_m_grouped_fp8_fp4_gemm_nt_contiguous_uses_grouped_b`
+- 本地验证：
+
+```bash
+python3 Consumer-DeepGEMM/tests/test_fp4_fallback.py
+```
+
+结果通过。当前环境没有 `pytest`，所以没有跑 `pytest -q`。
+
+这个修复不是性能解法，但它把 Python fallback 的 MoE 语义接正了。后续 CUTLASS 79d kernel 可以替换 `_m_grouped_fp8_fp4_fallback_nt` 的内部实现，不需要再改 vLLM-facing API。
+
+**2026-05-03 追加：Docker 可装载路径打通**
+
+- 新增顶层 `deep_gemm` compatibility package：
+  - `import deep_gemm` 会转发到 `consumer_deep_gemm`
+  - 补了最小 `deep_gemm.utils.math`，避免 vLLM/测试 import 直接炸
+- 新增 `consumer_deep_gemm/mega.py`：
+  - 实现纯张量的 `transform_weights_for_mega_moe`
+  - `get_symm_buffer_for_mega_moe` / `fp8_fp4_mega_moe` 先明确 `NotImplementedError`
+  - 这不是最终 MegaMoE 解法，只是让 import 链和权重 transform 链先落地
+- 修复 FP4 fallback 支持 vLLM 实际传入的 `int8` packed FP4 view
+- 修复 `get_mk_alignment_for_contiguous_layout()` 返回类型：Consumer 包内部返回 int，vLLM wrapper 再包装成 `[align, align]`
+- 新增 Docker 内安装脚本：
+
+```bash
+cd /work/Consumer-DeepGEMM
+./scripts/install_in_vllm_container.sh
+```
+
+脚本动作：
+
+1. `pip install -e .`
+2. 构建 `consumer_deep_gemm._C`
+3. 写入 `vllm.third_party.deep_gemm` shim
+4. patch vLLM 的 DeepGEMM 支持检查，让 SM120/SM121 通过（原来只认 SM90/SM100）
+5. 打印 `deep_gemm` 和 `vllm.third_party.deep_gemm` 的 native probe
+
+已验证：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/install_in_vllm_container.sh'
+```
+
+输出确认：
+
+```text
+deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+vllm.third_party.deep_gemm: {'available': True, 'cutlass_sm120_probe': True, 'arch': 'sm_121a'}
+```
+
+中途踩到 Docker bind mount owner 不一致导致 `git safe.directory` 报错，已在 installer 里自动处理。
+
+**当前边界**：现在已经能“放进 vLLM Docker 里安装、import、通过 SM121 support gate、构建 native 扩展探针”。还不能证明长输出垃圾消失，因为真实 CUTLASS 79d grouped FP4 GEMM kernel 仍未接入，native `_C` 仍只有 probe。
+
+**2026-05-03 追加：native ABI 钉死，准备合入 Docker 测试**
+
+- `_C` 新增 `m_grouped_fp8_fp4_gemm_nt_contiguous` 入口：
+  - 接收 DeepGEMM/vLLM 形态：`(a, a_scale), (b, b_scale), d, m_indices, **kwargs`
+  - C++ 侧检查 CUDA、contiguous、dtype、shape、`m_indices` 长度
+  - 当前检查通过后返回 `None`，让 Python fallback 继续负责正确性计算
+  - 这个设计是刻意的：ABI 先稳定，后面接 CUTLASS 79d 时只替换函数内部 launch，不再改 Python/vLLM-facing 接口
+- 修复 native wrapper：只有 CUDA tensor 才进 `_C`，CPU 测试仍走 fallback
+- 新增 `tests/test_native_abi.py`：
+  - CUDA 可用且 native extension 可用时，验证 `_C` ABI 可调用
+  - 验证 native 返回 `None` 后 Python fallback 输出 `[[5], [8], [0], [5]]`
+- 已验证：
+
+```bash
+python3 Consumer-DeepGEMM/tests/test_fp4_fallback.py
+python3 Consumer-DeepGEMM/tests/test_native_abi.py
+```
+
+带 GPU Docker 验证：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh >/tmp/build.log && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_native_abi.py'
+```
+
+结果通过。下一步可以把当前 Consumer-DeepGEMM 合入 vLLM Docker 做安装链路测试；真实长输出修复仍依赖 CUTLASS 79d kernel 接入。
+
+**2026-05-03 追加：CUTLASS 例子路线修正**
+
+继续拆 79d 时发现一个重要问题：`79d_blackwell_geforce_nvfp4_grouped_gemm.cu` 本体不是 vLLM 需要的算子。
+
+- 79d：NVFP4 × NVFP4 grouped GEMM，并且输出也是 FP4 + 输出 scale factor
+- vLLM / DeepSeek V4 FP4 MoE 实际需要：FP8 activation × packed FP4 weight -> BF16 output
+- 更接近的非 grouped 例子是：
+  - `72c_blackwell_mixed_mxfp8_bf16_gemm.cu`
+  - `79c_blackwell_geforce_mixed_mxfp8_mxfp6_bf16_gemm.cu`（混合窄精度形态更接近，但 B 是 FP6 示例）
+- 79d 仍然有价值，但价值在 grouped pointer-array plumbing：
+  - `GroupProblemShape<Shape<int,int,int>>`
+  - `ptr_A/ptr_B/ptr_SFA/ptr_SFB/ptr_D`
+  - `stride_A/stride_B/layout_SFA/layout_SFB/stride_D`
+  - `GemmUniversalMode::kGrouped`
+
+正确路线不是机械搬 79d，而是：
+
+1. 用 72c/79c 的 FP8×FP4/MX narrow precision BF16 epilogue 定 kernel 类型
+2. 用 79d 的 grouped problem 和 pointer-array launch 结构
+3. 第一版只支持 vLLM 实际路径：`A[M,K]`、`B[G,N,K/2]`、`D[M,N]`、per-row `expert_ids`
+4. 如果 CUTLASS 类型系统不接受 FP8×NVFP4 这个组合，再退一步做 explicit dequant + BF16 grouped GEMM 正确性 kernel，先消灭 Marlin 静默错误，再谈性能
+
+这个判断要记住：**79d 是 plumbing 来源，不是目标算子本体。**
+
+**2026-05-03 追加：CUTLASS FP8×FP4 grouped 类型探针通过**
+
+在 Consumer-DeepGEMM 新增 `csrc/cutlass_mxfp8_mxfp4_probe.cu`：
+
+- 单 GEMM 类型探针通过：
+  - `ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>`
+  - `ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>`
+  - `ElementD = cutlass::bfloat16_t`
+  - `ArchTag = cutlass::arch::Sm120`
+- grouped pointer-array 类型探针通过：
+  - `GroupProblemShape<Shape<int,int,int>>`
+  - `ElementA, LayoutATag*`
+  - `ElementB, LayoutBTag*`
+  - grouped epilogue 必须用 `LayoutCTag*` / `LayoutDTag*`
+- `GroupedGemm::Arguments` 构造类型探针通过：
+  - problem shape
+  - ptr arrays
+  - stride arrays
+  - SFA/SFB layout arrays
+  - epilogue fusion args
+  - scheduler args
+
+验证命令：
+
+```bash
+docker run --rm \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/build_native_sm120.sh'
+```
+
+输出：
+
+```text
+{'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+结论：SM120 上 `mx_float8 × mx_float4 -> bf16` + grouped pointer-array 不是死路，CUTLASS 类型系统已经接受。下一步从类型探针推进到真实 CUDA tensor 指针数组、workspace、`can_implement()`，再到真正 launch。
+
+**2026-05-03 追加：真实 CUDA tensor 的 `can_implement()` probe 通过**
+
+继续推进 `csrc/cutlass_mxfp8_mxfp4_probe.cu`：
+
+- 新增 `cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d)`
+- 从真实 CUDA tensor shape 推出：
+  - `groups = b.size(0)`
+  - `M = a.size(0)`
+  - `K = a.size(1)`
+  - `N = b.size(1)`
+- 构造 grouped `problem_sizes`
+- 构造 `stride_A/B/C/D`
+- 构造 `layout_SFA/SFB`
+- 构造 epilogue fusion args、hardware info、scheduler args
+- 调用 `GroupedGemm::can_implement(arguments)`
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc 'PYTHONPATH=/work/Consumer-DeepGEMM python3 - <<PY
+import torch
+from consumer_deep_gemm import native
+a = torch.empty((128, 128), device="cuda", dtype=torch.float8_e4m3fn)
+b = torch.empty((2, 128, 64), device="cuda", dtype=torch.int8)
+d = torch.empty((128, 128), device="cuda", dtype=torch.bfloat16)
+print(native.cutlass_mxfp8_mxfp4_can_implement_probe(a, b, d))
+PY'
+```
+
+输出：
+
+```text
+True
+```
+
+同时把这个检查加入 `tests/test_native_abi.py`。当前阶段已经从“类型能编”推进到“CUTLASS 对真实 CUDA tensor 推出的 grouped problem 返回 can_implement=True”。下一阶段才进入真实 pointer arrays / workspace / `initialize()` / `run()`。
+
+下一步：
+
+1. 从 72c/79c + 79d 组合出 FP8×FP4 grouped BF16 kernel
+2. 先实现 `m_grouped_fp8_fp4_gemm_nt_contiguous`
+3. Python API 已经接好 native 优先、fallback 兜底
+4. 接上真实 kernel 后，再集成 vLLM 服务验证长输出垃圾是否消失
+
+---
+
+## 经验总结
+
+1. **DGX Spark 双机 ≠ 一台大机器**——是分布式集群，所有分布式的坑一个不少
+2. **DeepSeek V4 太新**——2026-04-24 发布，NGC 26.03 容器不支持，生态还没跟上
+3. **不要在 NGC 容器里 pip 升级 torch**——NGC 的 torch 是深度定制的，社区版不兼容
+4. **Mac 的优势是零配置**——统一内存 + MLX/llama.cpp，一条命令跑模型；代价是没有 Blackwell FP4 加速
+5. **200Gbps CX7 够用但不是 NVLink**——跨机 TP 每层通信延迟是微秒级（NVLink 是纳秒级），MoE 模型通信量小所以影响可控
+6. **rsync 走 CX7 很快**——581MB/s，160G 五分钟，比 WiFi 快几十倍
+7. **sm_121 是软件孤儿，不是硬件孤儿**——DGX Spark 的 GB10 (sm_121) 硬件指令完整（INT8/FP8/FP4 mma 全有），但 DeepGEMM/vLLM 的 CUDA kernel 绑定 tcgen05 不认它，需要 Triton fallback 走 mma.sync 族（⚠️ 2026-05-10 更正，原文写的是"孤儿架构"暗示硬件弱，实际是软件适配问题）
+8. **Docker build 里的代理是大坑**——容器网络隔离，宿主机的透明代理不生效；GitHub 需要翻墙但 apt/pip/PyTorch 不需要，`noProxy` 配置是场噩梦；最终方案：不用代理，GitHub 相关的在宿主机 clone 好 COPY 进去
+9. **"256GB 共享内存"是营销话术**——实际是两台独立机器通过 RDMA 网络组成的分布式集群，模型权重两边各存一份，GPU 通信走 NCCL + CX7
+10. **sm_120 前向兼容 sm_121**——torch 社区版只编译到 sm_120，但 sm_121 能跑 sm_120 的 kernel。编译时指定 `TORCH_CUDA_ARCH_LIST="12.0"` 就行
+11. **Docker 里编译 vLLM 需要约 1 小时**——ARM64 Grace CPU 10 核，MAX_JOBS=16。每次改一行重新编译都是一小时。一定要一次改对
+
+---
+
+## 2026-05-03 深夜：Consumer-DeepGEMM native grouped FP8×FP4 接入
+
+目标：解决 DeepSeek V4 Flash 长输出垃圾。根因仍是 Marlin MXFP4 MoE 在 SM120/SM121 上部分专家静默算错；这轮工作把 Consumer-DeepGEMM 从 probe 推进到真实 CUTLASS launch。
+
+已完成：
+
+1. **`m_grouped_fp8_fp4_gemm_nt_contiguous` 接入真实 native launch**
+   - Python API 仍保持 DeepGEMM 副作用语义：填充 `d`，返回 `None`
+   - C++ binding 在 native 成功时内部返回 `True`，Python 层吞掉这个返回值
+   - 不支持的形态继续退回 Python fallback
+
+2. **CUTLASS grouped launch 打通**
+   - 构造真实 device pointer arrays
+   - 构造 grouped problem sizes / strides / SFA/SFB layouts
+   - 分配 CUTLASS workspace
+   - 使用当前 CUDA stream 调 `initialize()` + `run()`
+   - 支持 vLLM 的 per-row `expert_ids`，包括 `-1` padding 行
+
+3. **DGX Spark 必须编 `sm_121a`**
+   - `sm_120a` 能编译、`can_implement()` 也能过，但真实 launch 会打印：
+     `Arch conditional MMA instruction used without targeting appropriate compute capability`
+   - 改默认 `CONSUMER_DEEP_GEMM_CUDA_ARCH=121a`
+
+4. **scale 语义修正**
+   - vLLM 传入的 activation / weight scales 常是 float32
+   - native 前统一转换成 E8M0 uint8
+   - activation SFA 从 `[M, K/128]` 扩成 CUTLASS SM120 MX layout 需要的 4 倍 scale atom
+   - `get_mk_alignment_for_contiguous_layout()` 默认改回 128，匹配 vLLM MoE scatter 的 `BLOCK_E=128`
+
+5. **数值 sanity 通过**
+   - 零输入 native launch 通过
+   - A=1、FP4 B=1、scale=1 的非零 reference case 输出全 128，说明基本计算路径正确
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm120:latest \
+  bash -lc './scripts/install_in_vllm_container.sh >/tmp/install.log && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_fp4_fallback.py && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_native_abi.py'
+```
+
+结果通过。
+
+已生成并同步双机镜像：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: 975ea7ef0cb7
+```
+
+host 和 slave 都已存在该镜像。镜像内包含：
+
+- `/opt/Consumer-DeepGEMM`
+- `/opt/DeepGEMM`
+- `consumer_deep_gemm._C` (`sm_121a`)
+- `vllm.third_party.deep_gemm` shim
+- vLLM SM120/SM121 DeepGEMM support gate patch
+
+验证输出：
+
+```text
+consumer {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+vllm {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+下一步：用 `vllm-node-sm121-cdg` 启动双机服务，跑长输出 prompt 验证乱码是否消失。
+
+### 追加：普通 FP8 linear 不再走 Consumer-DeepGEMM
+
+启动过程中连续修掉两层 ABI 后，服务进入 `determine_available_memory` 的 dummy run，但普通 FP8 linear 路径被 vLLM 的 DeepGEMM FP8 block kernel 接管，最终把 DeepGEMM 重排后的 weight scale layout 传给 Consumer 的 Python fallback：
+
+```text
+RuntimeError: The size of tensor a (1536) must match the size of tensor b (12) at non-singleton dimension 0
+```
+
+判断：这不是 MoE FP4 静默算错根因。Consumer-DeepGEMM 这轮只应该接管 DeepSeek V4 MoE FP4 grouped GEMM；普通 FP8 linear 原本已有 vLLM 非 DeepGEMM kernel 可用，不该继续在 Consumer fallback 里补 DeepGEMM FP8 scale layout。
+
+处理：
+
+- 保留 `platforms/cuda.py` 和 `deep_gemm_moe.py` 的 SM120/SM121 放行，让 fused MoE 能用 Consumer-DeepGEMM
+- 在 `model_executor/kernels/linear/scaled_mm/deep_gemm.py` 中让 `DeepGemmFp8BlockScaledMMKernel` 在 SM120/SM121 返回 unsupported
+- 这样 vLLM 的普通 FP8 block linear 会跳过 DeepGEMM / FlashInfer+DeepGEMM 动态 kernel，落到后续非 DeepGEMM kernel
+
+镜像已重建并同步双机：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: ac1aa7fa36fc
+```
+
+容器内检查：
+
+```text
+DeepGemmFp8BlockScaledMMKernel.is_supported()
+=> (False, 'Consumer-DeepGEMM on SM120/SM121 is only enabled for DeepSeek V4 MoE FP4; ordinary FP8 linear should use the non-DeepGEMM vLLM kernels.')
+```
+
+### 追加：DeepGEMM warmup 也要跳过普通 FP8 linear
+
+继续启动后，`determine_available_memory` 已通过，说明普通 forward dummy run 不再走 DeepGEMM FP8 linear；但 `compile_or_warm_up_model` 阶段的 DeepGEMM warmup 仍然独立扫描模型里的 FP8 linear module，并直接调用 `fp8_gemm_nt`：
+
+```text
+vllm/model_executor/warmup/deep_gemm_warmup.py
+deepgemm_fp8_gemm_nt_warmup -> fp8_gemm_nt -> Consumer fallback
+RuntimeError: The size of tensor a (1536) must match the size of tensor b (12)
+```
+
+处理：在 `deep_gemm_warmup.py` 的 `_fp8_linear_may_use_deep_gemm()` 中，SM120/SM121 直接返回 `False`。这样普通 FP8 linear 的 warmup 统计和实际 warmup 都跳过；MoE grouped warmup 保留。
+
+镜像已再次重建并同步双机：
+
+```text
+vllm-node-sm121-cdg:latest
+image id: ab948bd4d9d9
+```
+
+### 当前停止点：服务已启动，但首个请求返回 500
+
+Zero 在本机验证当前镜像：
+
+```bash
+docker run --rm --gpus all vllm-node-sm121-cdg:latest bash -lc 'python3 - <<PY
+import consumer_deep_gemm as dg
+import vllm.third_party.deep_gemm as vdg
+print("consumer", dg.native_build_info())
+print("vllm", vdg.native_build_info())
+PY'
+```
+
+输出确认镜像内 shim 和 native extension 均存在：
+
+```text
+consumer {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+vllm {'available': True, 'cutlass_sm120_probe': True, 'cutlass_mxfp8_mxfp4_probe': True, 'arch': 'sm_121a'}
+```
+
+随后 `curl /v1/chat/completions` 已能连上服务，但返回：
+
+```text
+{"error":{"message":"EngineCore encountered an issue. See stack trace (above) for the root cause.","type":"InternalServerError","param":null,"code":500}}
+Total time: 14.863565s
+```
+
+这说明服务已经越过了前面的模型加载、KV cache profile、compile/warmup 阶段，至少 HTTP server 已可接请求；当前问题进入“真实请求 forward / decode”阶段。
+
+已做的最小观察：
+
+- 本机 `docker ps` 看到正在运行的容器名为 `ray-head`，image 显示 `nvcr.io/nvidia/vllm:26.03-py3-dsv4`
+- 这不一定代表没用 `vllm-node-sm121-cdg`，因为 launch 脚本可能保留底层 image metadata / 容器名；但下一轮需要先确认 `ray-head` 内实际文件是否为新镜像内容
+- `docker logs --tail 500 ray-head` 只看到旧的 NGC banner 和 driver compatibility 信息，没有抓到这次 500 对应的完整 traceback；需要扩展日志抓取范围或进入容器查 Ray/vLLM worker 日志
+
+下一轮建议入口：
+
+1. 先确认正在跑的 `ray-head` 容器内是否确实是 `ab948bd4d9d9` 这版内容：
+
+   ```bash
+   docker exec ray-head python3 - <<'PY'
+   import consumer_deep_gemm as dg
+   import vllm.third_party.deep_gemm as vdg
+   from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import DeepGemmFp8BlockScaledMMKernel
+   from vllm.platforms import current_platform
+   print("consumer", dg.native_build_info())
+   print("vllm", vdg.native_build_info())
+   print("family120", current_platform.is_device_capability_family(120))
+   print("fp8_linear_deepgemm_supported", DeepGemmFp8BlockScaledMMKernel.is_supported())
+   PY
+   ```
+
+2. 抓真实请求的 EngineCore / Ray worker traceback：
+
+   ```bash
+   docker logs --since 10m ray-head 2>&1 | grep -A180 -B40 -E 'ERROR|Traceback|InternalServerError|EngineCore encountered'
+   ```
+
+   如果 stdout 仍没有完整栈，再查容器内 Ray session logs：
+
+   ```bash
+   docker exec ray-head bash -lc 'find /tmp/ray -type f \( -name "*.out" -o -name "*.err" -o -name "*.log" \) -mmin -30 | sort | tail -80'
+   ```
+
+3. 根据新 traceback 判断是：
+   - Consumer-DeepGEMM native grouped FP8×FP4 forward 真实形态不匹配
+   - vLLM 某条普通 FP8 / attention / TileLang 路径仍被 DeepGEMM warmup 之外的逻辑误接管
+   - 或启动容器并非最新 `vllm-node-sm121-cdg`
+
+当前工作状态：先停在这里，不继续追。主线仍是”解决输出异常”，但下一步必须以这次 500 的真实服务端 traceback 为准。
+
+### 2026-05-03 下午：Bug 修复 + Scale Reorder + 输出正确性验证 ✅
+
+本轮解决了从”服务 500 错误”到”长输出全是空/垃圾”的全部问题链。
+
+#### Bug 修复（Python 层）
+
+1. **`segments_from_indices` 不支持非连续 expert_ids**（C++ 侧）
+   - 旧：同组行必须连续，否则退回 Python fallback（太慢）
+   - 新：引入 scatter/gather——按 group 排序行到临时 buffer，CUTLASS launch 在连续 buffer 上执行，结果 scatter 回原始位置
+
+2. **`m_grouped_fp8_gemm_nt_contiguous` 等 6 个 grouped/masked 函数忽略 `m_indices`/`masked_m`**
+   - 全部修复为正确按 group 路由
+
+3. **`fp8_einsum` 忽略 scale factors**
+   - 修复为正确 dequantize
+
+4. **`_float_scale_to_e8m0` 用 `ceil` 而非 `round`**
+   - 改用 `torch.round`
+
+5. **`per_block_cast_to_fp8`/`per_token_cast_to_fp8` 返回 dummy scale=1.0**
+   - 修复为正确计算 per-block/per-token amax 并缩放
+
+6. **`get_paged_mqa_logits_metadata` 返回 `None`**
+   - 根因：vLLM MLA indexer 调这个函数拿 SM work distribution metadata，`None` 赋给 CUDA IntTensor 直接炸
+   - 实现了完整的 Python fallback：prefix sum + binary search 分配 KV segments 到 SMs，输出 `[num_sms+1, 2]` int32 tensor
+
+7. **`pip install -e .` editable 安装导致 `deep_gemm` 顶层包在 docker commit 后丢失**
+   - `_lazy_init` 找不到 `get_mk_alignment_for_contiguous_layout` → RuntimeError
+   - 改成 `pip install .` 非 editable + 带 CUDA 编译，`install_in_vllm_container.sh` 先 build native 再 pip install
+
+8. **`gpu-memory-utilization=0.85` 导致 slave OOM**
+   - 降到 0.80，slave 不再被 OOM killer 杀
+
+#### Scale Factor Layout 修复（核心）
+
+**根因**：CUTLASS SM120 的 block-scaled MX kernel 对 scale factor 有特殊的 SfAtom tile-interleaved 内存布局要求，与 vLLM 传来的 row-major `[M, K/128]` 不同。
+
+SfAtom K-major layout:
+```
+Shape:  ((32, 4), (SFVecSize, 4))
+Stride: ((16, 4), (0, 1))
+```
+
+vLLM 的 activation scale 是 `[M, K/128]`（每 128 个 K 元素一个 scale），但 CUTLASS 的 SFVecSize=32（每 32 个 K 元素一个 scale）。需要：
+1. `repeat_interleave(4)` 把 `[M, K/128]` 扩展成 `[M, K/32]`
+2. 按 SfAtom 的 tile 结构重排：`[m_tiles, k_tiles, m_in_32, m_32, k_in_4]` with strides `(*, *, 16, 4, 1)`
+
+**修复方案**：在 C++ 侧 `launch_grouped_fp8_fp4` 内部，每个 group 独立做 scale reorder。CPU 侧 `reorder_scale_for_cutlass()` 函数按 SfAtom offset 公式 `m_in_32*16 + m_32*4 + k_in_4` 逐元素重排，然后 copy 到 device。SFA 和 SFB 都做 per-group reorder，避免了 Python 侧全局 reorder 破坏 grouped pointer offset 的问题。
+
+padding 用 E8M0=127（=2^0=1.0）而非 0（=2^-127≈0），否则 padding 位置会把结果缩放到零。
+
+#### 验证结果
+
+```
+短输出测试：
+“2+2等于几” → “2+2 等于 **4**。” ✅ (29s, 10 tokens)
+
+长输出测试：
+“请用500字介绍万里长城” → 完整的 420 token 高质量中文 ✅ (542s)
+finish_reason: stop（模型自己决定停止）
+```
+
+#### 性能优化：GPU scale reorder（2026-05-03 晚）
+
+Scale reorder 从 CPU (`reorder_scale_for_cutlass` 逐元素重排 + H2D copy) 改成 GPU CUDA kernel (`reorder_scale_kernel` + `reorder_scale_on_gpu`)。SFA 和 SFB 都在 GPU 上完成重排。
+
+结果：518s vs 542s，几乎无变化。瓶颈不在 reorder 计算本身，而在：
+
+1. **`m_indices.to(kCPU)` 同步**：每次 CUTLASS launch 都要把 expert_ids 拷回 CPU 做 segment 解析，120 次/token（60 层 × 2 FC），每次都是 GPU→CPU 同步屏障
+2. **Per-launch tensor 分配**：每次 launch 分配 SFA/SFB buffer + pointer array device tensors
+3. **Host-side vector → device copy**：problem_sizes、strides、layouts、pointer arrays 全部从 CPU vector 拷到 GPU
+
+~1.2 s/token 对 280B MoE 来说是 CUTLASS grouped GEMM 的 launch overhead 决定的，不是计算本身。
+
+#### 性能优化方向（待做）
+
+1. **`segments_from_indices` GPU 化**：把 expert_ids 解析移到 GPU kernel，消除 120 次/token 的 GPU→CPU 同步
+2. **SFB 一次性预重排**：模型加载时对所有专家的 weight scale 做一次 SfAtom reorder 存回去，运行时直接用 pointer 偏移
+3. **Pointer array 预分配**：把 problem_sizes/strides/layouts 缓存到固定 device buffer，只更新变化的 M 值
+4. **去掉诊断日志**（`_fp4_diag_count`）
+
+#### 当前双机镜像
+
+```text
+vllm-node-sm121-cdg:latest
+image id: 403bb0b47ec5
+```
+
+#### 启动命令（Consumer-DeepGEMM 版，已废弃）
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1” \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-sm121-cdg exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.80 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 1000000 \
+  --enforce-eager
+```
+
+---
+
+## 第八阶段：jasl/vllm fork 重新构建（2026-05-04）
+
+Consumer-DeepGEMM 正确但太慢（0.8 tok/s），转向社区方案。
+
+### 背景
+
+jasl（GitHub: github.com/jasl/vllm，分支 ds4-sm120）用 Triton 重写了 DeepSeek V4 的关键 kernel（sparse MLA、FP8 einsum、paged MQA 等），绕过 Marlin 走完全不同的计算路径。PR #40991 提给 vLLM 官方（draft 状态）。社区已有多人在 DGX Spark 上验证 ~15-22 tok/s。
+
+### 构建
+
+eugr/spark-vllm-docker 更新到最新（多了 `mods/exp-b12x/run.sh`），jasl/vllm 的 `ds4-sm120` 分支也大幅更新（+31000 行，454 文件变更）。
+
+构建方法：改 Dockerfile 第 190 行 clone URL 从 `vllm-project/vllm` 改成 `jasl/vllm`：
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+# Dockerfile 第 190 行改为: git clone --recursive https://github.com/jasl/vllm.git
+./build-and-copy.sh -t vllm-node-jasl -c 169.254.30.81 --vllm-ref ds4-sm120
+```
+
+编译 30 分钟，copy 1 分钟。
+
+### 实测结果
+
+| Prompt | 结果 | Tokens | 时间 | 速度 |
+|--------|------|--------|------|------|
+| “2+2等于几” | ✅ 正确 “4” | 10 | 16.8s（含 warmup） | — |
+| “请用500字介绍万里长城” | ✅ 完美中文 | 414 | 29.3s | ~14 tok/s |
+| “写一个Python快速排序函数” | ✅ 完美代码 | 500 | 36.5s | ~13.7 tok/s |
+| “What is quicksort? Explain with code.” | ❌ 全程垃圾 | 500 | 35.7s | — |
+| “什么是快速排序？用英文解释并给出代码。” | ⚠️ 开头垃圾，后半修正 | 500 | 35.4s | — |
+
+**中文完美，英文有残留问题。** 社区已知 “occasional spurious tokens”——jasl 用 Triton 重写了大部分路径，但可能有少量 fallback 仍走原始 Marlin 代码。
+
+速度对比：Consumer-DeepGEMM 0.8 tok/s → jasl fork **14 tok/s**，快 18 倍。
+
+### 还试了 eugr exp-b12x 方案（走不通）
+
+PR #40082（meena-at-work/vllm 的 `integrate-flashinfer-b12x-moe` 分支）的 FlashInfer CuTeDSL b12x backend 只注册在 **NVFP4** oracle 中，DeepSeek V4 Flash 用的是 **MXFP4**，走的是完全不同的 backend 选择路径。对 DeepSeek V4 无效。
+
+### 当前推荐镜像
+
+```text
+vllm-node-jasl:latest
+```
+
+### 当前推荐启动命令
+
+```bash
+cd /home/lmxxf/work/deepseek-v4-flash-deployment/spark-vllm-docker
+
+HF_HOME=/home/lmxxf/work/deepseek-v4-flash-deployment \
+VLLM_SPARK_EXTRA_DOCKER_ARGS=”-e TRANSFORMERS_OFFLINE=1 -e HF_HUB_OFFLINE=1” \
+./launch-cluster.sh -n 169.254.248.35,169.254.30.81 -t vllm-node-jasl exec \
+  vllm serve /root/.cache/huggingface/deepseek-v4-flash \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --gpu-memory-utilization 0.85 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 131072 \
+  --enforce-eager
+```
+
+### Consumer-DeepGEMM Profiling 更新（2026-05-06）
+
+重启后重新跑 profiling（间隔 10 次打印），200 字北京测试 prompt：
+
+```text
+稳态数据（~11000 calls 后收敛）：
+  m_grouped_fp8_fp4_gemm_nt_contiguous  avg = 13.8 ms/call（之前 31 ms → 快了 2.2 倍）
+  get_paged_mqa_logits_metadata         avg = 0.17 ms/call（忽略不计）
+
+比例：每生成 1 token 约 89 次 FP4 GEMM + 1 次 metadata
+总 GEMM 时间占比：~99.98%
+```
+
+对比之前（2026-05-03）：31ms/call → 现在 13.8ms/call。改善来自重启后 CUDA JIT cache 和 warmup 更完整。但仍然比 jasl fork（14 tok/s）慢一个数量级——瓶颈不在单次 kernel 速度，在 launch 次数（89 次/token × CPU↔GPU 同步）。
+
+Consumer-DeepGEMM 的价值确认为**根因验证工具**，不是性能方案。
+
+---
+
+### 待解决：修复英文输出垃圾
+
+jasl fork 中文完美但英文有残留问题。Consumer-DeepGEMM 验证时中英文都正确（底层 GEMM 全换了），说明 jasl 的 Triton 重写没有覆盖所有路径——某些残余路径仍 fallback 到 Marlin。
+
+**下一步排查计划：**
+
+1. **抓 kernel dispatch 日志**——用英文垃圾 prompt 和中文正常 prompt 各跑一次，对比 vLLM 日志里哪些 kernel 走了 Triton、哪些 fallback。jasl 代码里应该有路径选择日志
+2. **diff 中英文的 dispatch 路径**——找出英文触发了而中文没触发的那条残余路径
+3. **定位残余路径的具体代码位置**——在 jasl 的 `ds4-sm120` 分支里找到对应的 fallback 点
+4. **用 Triton 补上那条路径**——参考 jasl 已有的 Triton kernel 风格，补写缺失的那个
+
+入口：`docker exec vllm_node` 进容器，开 `VLLM_LOGGING_LEVEL=DEBUG` 或在 jasl 的 kernel dispatch 逻辑里加日志。重点关注 `fused_moe/` 和 `deepseek_v4.py` 里的 backend 选择分支。
+
+**其他待跟踪：**
+- vLLM 0.20.0/0.20.1 没有修复 sm_120+ MXFP4 MoE 问题
+- DeepGEMM 明确不打算支持 sm_120+
+- jasl PR #40991 何时合入主线
+
+---
+
+## 第九阶段：jasl 最新版重新构建 + 英文测试验证（2026-05-05）
+
+### 目标
+
+jasl 5-05 又推了几个 commit，验证英文输出是否修好。同时验证 Consumer-DeepGEMM 英文正确性。
+
+### jasl 5-05 新 commit
+
+```
+8d8496de3 Release DeepSeek V4 protected prompt refs under pressure
+31d2248c4 Reserve DeepSeek V4 prefill workspace during profiling
+a3b9403ab Fix DeepSeek V4 MLA prefix cache reuse
+6e0dc7b7c Forward DeepSeek V4 MoE clamp limit
+dc934294b Add vLLM logprobs oracle comparator
+8427cd7d3 Align DeepSeek V4 API semantics
+dc7883cc2 Add SM12x DeepSeek V4 fallback runtime
+```
+
+都是 MLA cache、prefill workspace、API 对齐——没有明确修英文垃圾的 commit。
+
+### 构建踩坑
+
+eugr/spark-vllm-docker 更新后 Dockerfile 结构变了，构建过程遇到一系列问题：
+
+#### 坑 1：Dockerfile COPY 路径指向旧代码
+
+Dockerfile 第 186 行 `COPY vllm-b12x-src/` 指向的是 meena-at-work/vllm（exp-b12x 老方案），不是 jasl/vllm。
+
+**解法**：改成 `COPY vllm-sm120/`，指向 jasl 最新代码。
+
+#### 坑 2：pip hash 校验失败
+
+`uv pip install vllm*.whl` 严格校验依赖包 hash，PyPI 上某些包更新了但 hash 没变。
+
+**解法**：`uv pip install --no-verify-hashes`。
+
+#### 坑 3：CMake FetchContent 在 Docker 内访问不了 GitHub
+
+vLLM 编译时 CMake FetchContent 要从 GitHub clone 6 个依赖：flash-attention、DeepGEMM、CUTLASS、triton_kernels、qutlass、FlashMLA。Docker 网络隔离够不着 GitHub。
+
+**解法**：全部在宿主机预先 clone，COPY 进 Docker，通过环境变量让 CMake 用本地路径：
+
+| 依赖 | 环境变量 | CMake 文件 |
+|------|---------|-----------|
+| flash-attention | `FETCHCONTENT_SOURCE_DIR_VLLM-FLASH-ATTN`（cmake 文件开头加一行） | `vllm_flash_attn.cmake` |
+| DeepGEMM | `DEEPGEMM_SRC_DIR` | `deepgemm.cmake` |
+| CUTLASS | `VLLM_CUTLASS_SRC_DIR` | `CMakeLists.txt` |
+| triton_kernels | `TRITON_KERNELS_SRC_DIR` | `triton_kernels.cmake` |
+| qutlass | `QUTLASS_SRC_DIR` | `qutlass.cmake` |
+| FlashMLA | `FLASH_MLA_SRC_DIR` | `flashmla.cmake` |
+
+**关键教训：所有 6 个都支持本地路径环境变量，一次性全堵上，别打地鼠。**
+
+#### 坑 4：依赖版本不对齐
+
+`--depth 1` clone 拿到的是最新 commit，但 jasl 的 cmake 里指定了特定 GIT_TAG。用 `FETCHCONTENT_SOURCE_DIR` / `*_SRC_DIR` 覆盖后 CMake 不再检查 GIT_TAG，版本不匹配导致：
+
+- flash-attention：`FLASHATTENTION_FP8_TWO_LEVEL_INTERVAL` 未定义（最新版改了 API）
+- qutlass：`fusedQuantizeMxQuestWithMask_host` 符号找不到（最新版改了函数名）
+
+**解法**：每个依赖都 `git checkout` 到 cmake 里指定的 commit：
+
+| 依赖 | 期望版本 |
+|------|---------|
+| flash-attention | `f5bc33cfc02c744d24a2e9d50e6db656de40611c` |
+| DeepGEMM | `891d57b4db1071624b5c8fa0d1e51cb317fa709f` |
+| qutlass | `830d2c4537c7396e14a02a46fbddd18b5d107c65` |
+| FlashMLA | `a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b` |
+| CUTLASS | v4.4.2 |
+| triton | v3.6.0 |
+
+**关键教训：`--depth 1` clone 的依赖必须 checkout 到 cmake 指定的 GIT_TAG，不能用最新版。**
+
+#### 坑 5：加载权重时 swap 爆满卡住
+
+`--gpu-memory-utilization 0.85` 时 host 85% 进度卡住不动，两台 swap 都用了 5-8GB。
+
+**解法**：降到 0.80。
+
+### 测试结果
+
+#### jasl 5-05 最新版
+
+```
+"请用500字介绍万里长城"
+→ 完美输出，336 tokens，finish_reason=stop ✅
+
+"What is quicksort? Explain with code."
+→ 开头垃圾（法语 plutôt、中文"而非""司空"、乱标点混在一起）
+→ 模型自己意识到乱码："Ah, I see that my previous attempt ended up
+  generating a lot of garbled text"，修正后输出正确的 quicksort 解释
+→ 比 5-04 好一点（能自救），但开头垃圾仍在 ❌
+```
+
+**结论：英文没修好。** jasl 的 5-05 更新（MLA cache、workspace 等）不涉及 Marlin fallback 路径。
+
+#### Consumer-DeepGEMM 对照测试
+
+用 5-03 的 `vllm-node-sm121-cdg` 镜像（还在）：
+
+```
+"What is quicksort? Explain with code."
+→ 从第一个 token 就是干净的英文 ✅
+→ 完整的 Markdown 格式、步骤讲解、Python 代码，零垃圾
+
+## What is Quicksort?
+
+Quicksort is a **divide-and-conquer** sorting algorithm that works by:
+1. Selecting a "pivot" element from the array
+2. Partitioning the array so elements smaller than pivot go left, larger go right
+3. Recursively sorting the left and right partitions
+（后续完整代码实现，全部正确）
+```
+
+**铁证：同样的权重、同样的 prompt，Consumer-DeepGEMM 英文完美，jasl fork 英文开头垃圾。唯一区别是底层 GEMM 计算路径。问题在 Marlin 残余 fallback，不在别处。**
+
+### 当前镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 用途 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 0.8 tok/s | 英文正确性验证 |
+
+### Dockerfile 改动汇总
+
+本轮对 `spark-vllm-docker/Dockerfile` 的改动：
+
+1. 第 186 行：`COPY vllm-b12x-src/` → `COPY vllm-sm120/`（指向 jasl 源码）
+2. 新增 6 行 COPY + 5 个 ENV：预置所有 FetchContent 依赖
+3. 第 317 行：`pip install` 替换 `uv pip install`（绕 hash 校验）
+4. `vllm_flash_attn.cmake` 开头加一行 `FETCHCONTENT_SOURCE_DIR`
+
+### 宿主机需要的预置文件
+
+```
+spark-vllm-docker/
+├── vllm-sm120/                  # jasl/vllm ds4-sm120（git checkout 到最新）
+│   └── .deps/vllm-flash-attn-src/  # flash-attention（checkout f5bc33c）
+├── DeepGEMM-src/                # DeepGEMM（checkout 891d57b）
+├── cutlass-src/                 # CUTLASS（来自 DeepGEMM/third-party/cutlass）
+├── triton-src/                  # triton v3.6.0
+├── qutlass-src/                 # qutlass（checkout 830d2c4）
+└── flashmla-src/                # FlashMLA（checkout a6ec2ba）
+```
+
+---
+
+## 第十阶段：尝试用 Triton 替换 Marlin FP4 MoE（2026-05-06，失败）
+
+### 目标
+
+分析 jasl fork 中英文垃圾的根因，尝试用 Triton MoE backend 替代 Marlin，修复英文输出。
+
+### 关键发现：jasl 替换的不是 MoE FP4 GEMM
+
+通过分析代码结构，发现了一个重要的认知修正：
+
+**jasl 的 Triton 重写覆盖的是 attention/MLA 路径（sparse MLA、paged MQA、FP8 einsum、hyperconnection），不是 FP4 MoE GEMM 路径。**
+
+FP4 MoE GEMM 一直走的是 Marlin，jasl 从来没动过这条路。中文能用不是因为 jasl 替换了 MoE kernel，而是中文激活的专家组合恰好没踩 Marlin 在 SM120 上的 bug。
+
+证据链：
+1. vLLM 启动日志：`Using 'MARLIN' Mxfp4 MoE backend` —— 即使用 jasl fork，MoE backend 仍然选的 Marlin
+2. jasl 的 `deepseek_v4_triton_kernels.py` 内容全是 attention 相关（paged MQA、FP8 KV cache 操作），没有 MoE GEMM
+3. oracle `_get_priority_backends()` 里 TRITON_UNFUSED 被注释掉了（"has bug with MTP support"），优先级列表 TRTLLM → DEEPGEMM → MARLIN，SM120 上前两个都不支持，直接 fallback 到 Marlin
+
+### 尝试 1：`--moe-backend triton`
+
+强制走 Triton MoE backend。
+
+**结果**：`kernel does not support current device cuda`
+
+原因：`gpt_oss_triton_kernels_moe.py` 的 `_supports_current_device()` 检查 `(9, 0) <= (cap.major, cap.minor) < (11, 0)`，SM121 = (12, 1) 不在范围内。
+
+### 尝试 2：修改设备检查上限 + 取消注释 TRITON_UNFUSED
+
+用 `sed` patch 容器内文件（不重新编译）：
+- `gpt_oss_triton_kernels_moe.py`：设备检查 `(11, 0)` → `(13, 0)`（两处）
+- `oracle/mxfp4.py`：设备检查 `(11, 0)` → `(13, 0)` + TRITON_UNFUSED 取消注释
+
+**结果**：Triton PTX codegen error
+
+```
+ptxas /tmp/tmpqq3oxlqq.ptx, line 4341; error: Feature '.tile::scatter4' not supported on .target 'sm_121a'
+```
+
+**根因**：Triton 标准库的 FP4 MoE kernel（`_p_matmul_ogs` from `triton_kernels`）在编译时生成了 SM100 专属的 `.tile::scatter4` PTX 指令。`.tile::scatter4` 属于 `tcgen05` 体系，在 SM121 上确实不存在。
+
+所以设备检查 `(11, 0)` 上限不是"保守"，是**正确的**——Triton 标准库的这个 kernel 确实会生成 SM120 不支持的 `tcgen05` 指令。改了检查也没用。
+
+**⚠️ 2026-05-10 补注**：`.tile::scatter4`（tcgen05 体系）不存在 ≠ FP4 mma 指令不存在。sm_121 有 `mma.sync.aligned` 族的 FP4 指令（`.e2m1` + `block_scale`，PTX ISA 9.2 确认）。Triton 标准库生成了错误的指令族（tcgen05 而非 mma.sync），不是 FP4 硬件本身不支持。用 Triton `tl.dot` 避开 tcgen05 专属指令可以走通 mma.sync FP4 路径。
+
+### 结论
+
+**SM120 上当时没有可用的 FP4 MoE GEMM 替代方案：**
+
+| 方案 | 状态 | 原因 |
+|------|------|------|
+| Marlin FP4 | 能跑但算错 | ~~SM120 的 FP4 MMA 行为差异~~ **⚠️ 更正：数据布局解释错误（按 sm_100 tcgen05 布局解释 sm_120 mma.sync 寄存器数据）** |
+| CUTLASS MXFP4（vLLM 内置） | 拒绝 SM120 | 依赖 TMA + tcgen05 |
+| Triton 标准 FP4 MoE | SM120 上编译失败 | 生成 `.tile::scatter4` 指令（tcgen05 体系），SM121 不支持 |
+| Consumer-DeepGEMM | 正确但 0.8 tok/s | CUTLASS SM120 模板，launch overhead 太大 |
+
+**jasl 的贡献**是修了 attention/MLA 路径（没有 jasl 的话连中文都跑不起来），但 FP4 MoE 这条路他没碰——也没法碰，因为没有 SM120 兼容的 FP4 MoE kernel 可用。
+
+**真正的修复方向**：写一个不使用 `.tile::scatter4` / TMA / tcgen05 的 SM120 兼容 Triton FP4 MoE kernel。这是一个独立项目级别的工作——Consumer-DeepGEMM 的 CUTLASS 版本证明了方向正确（输出正确），但需要 Triton 版本来获得实用速度（消除 launch overhead）。
+
+### 改动已回滚
+
+设备检查的修改已 `git checkout -- .` 回滚，不合入。
+
+---
+
+## 第十一阶段：Consumer-DeepGEMM launch overhead 优化（2026-05-06）
+
+### 目标
+
+Consumer-DeepGEMM 输出正确（中英文均无垃圾），但速度只有 0.8 tok/s。分析瓶颈并优化。
+
+### 瓶颈分析
+
+**实际 MoE GEMM 参数**（decode 1 token, top_k=6）：
+- FC1: `[M_sum, 7168] × [256, 4096, 3584]` → `[M_sum, 4096]`
+- FC2: `[M_sum, 2048] × [256, 7168, 1024]` → `[M_sum, 7168]`
+- M_sum = 384（6 个专家各 64 行 padding，只有 6 行有效数据）
+- 每 token 调用 120 次 `m_grouped_fp8_fp4_gemm_nt_contiguous`（60 层 × 2 FC）
+
+**瓶颈不在计算，在 launch overhead**。每次 CUTLASS grouped GEMM 调用的固定开销：
+1. `segments_from_indices`：GPU→CPU 同步（384 个 int32 拷回 CPU）×120 次/token
+2. SFB reorder：256 个专家的 weight scale 每次重新做 SfAtom reorder ×120 次
+3. 13 次 `device_copy_from_host`：strides/layouts/pointer arrays CPU→GPU ×120 次
+4. CUTLASS `can_implement()` + `get_workspace_size()` + `initialize()` + `run()`：每次重新初始化
+5. workspace 每次重新分配
+
+每次 launch ~8ms × 120 = ~1s/token → 0.76 tok/s。计算本身（M=1-2 行/专家的微型 GEMM）几乎不花时间。
+
+### 优化改动（Phase 1）
+
+1. **SFB 缓存**：用 `static unordered_map<uintptr_t, SFBCacheEntry>` 按 `b_scale.data_ptr()` 做 key。第一次调用时对全部 256 个专家的 weight scale 做一次 SfAtom reorder 并缓存在 GPU 上，后续调用直接用 pointer 偏移。消灭 720 次/token GPU reorder kernel。
+
+2. **GPU segment 提取**：新增 `extract_segments_kernel`（单线程 GPU kernel）替代 CPU `segments_from_indices`。GPU→CPU 同步从拷贝 384 个 int32 降低到拷贝 ~19 个 int32（1 个 num_segments + 3×active 个 segment 元数据）。
+
+3. **Workspace 缓存**：`get_workspace()` 只增长不缩小，避免每次 malloc。
+
+4. **预分配 segment metadata buffer**：`seg_group/seg_start/seg_count/num_segments` 一次分配重复使用。
+
+5. **去掉 gather/scatter 路径**：vLLM contiguous layout 保证同一 group 行连续，不需要 gather 到临时 buffer。
+
+6. **只接受 per-row expert_ids 格式**：cumsum 格式回退到 Python fallback。
+
+### 测试结果
+
+```
+英文测试（cold cache）：
+"What is quicksort? Explain with code."
+→ 内容正确（无垃圾），但模型用中文回答了英文问题
+→ 500 tokens / 656s = ~0.76 tok/s
+```
+
+**速度基本无变化**（上次 0.77 tok/s）。SFB 缓存省掉的开销在总时间里占比太小。
+
+第二次测试（warm cache）：
+```
+"What is quicksort? Explain with code."
+→ 干净的英文输出 ✅（quicksort 解释 + Java 代码）
+→ 500 tokens / 637s = ~0.79 tok/s
+```
+
+第一次 cold start 用中文回答英文问题，第二次 warm cache 正常英文输出。cold start 时 SFB 缓存初始化（256 个专家的 weight scale 一次性 reorder）可能扰动了前几个 token 的路由。正确性无问题。
+
+### 瓶颈确认
+
+真正的时间杀手是 **120 次/token 的 CUTLASS `initialize()` + `run()` 调用**。每次 launch 的固定开销（构建 arguments、H2D pointer arrays、CUTLASS 初始化）~8ms，这个改不掉——是 CUTLASS grouped GEMM API 的设计决定的。
+
+### 下一步：方案 1 — FP4 反量化 + cuBLAS BF16 matmul
+
+绕开 CUTLASS grouped GEMM，改用：
+1. GPU kernel 把选中的 6 个专家 FP4 权重反量化为 BF16（~0.1ms/专家）
+2. `torch.mm` 做 BF16 matmul（cuBLAS 对小 M 优化好）
+3. 120 次 CUTLASS launch → 12 次 `torch.mm`（6 专家 × 2 FC）
+
+反量化的 BF16 是临时 tensor，用完即释放，峰值只多占 ~16MB。
+
+预估提速 10-20×，目标 5-10 tok/s。
+
+### 方案 1 实测结果（2026-05-06 下午）
+
+实现了 FP4 反量化 + cuBLAS 路径，完全绕开 CUTLASS grouped GEMM：
+- 只反量化被选中的 6 个专家（不是全部 256 个）
+- 每个专家用 `_dequant_fp4_block`（PyTorch 向量化 GPU 操作）+ `torch.mm`
+- 修复 `_dequant_fp8_block` 从 scale shape 推断 block_k
+
+```
+测试1 "2+2等于几"         →  14 tokens, stop ✅
+测试2 "请用500字介绍万里长城" → 454 tokens / 583s = ~0.78 tok/s ✅
+测试3 "What is quicksort?" → 500 tokens / 638s = ~0.78 tok/s ✅（干净英文）
+测试4 "写一个Python快排"    → 500 tokens / 635s = ~0.79 tok/s ✅
+```
+
+**正确性完美（中英文均无垃圾），但速度完全没变。**
+
+### 关键发现：瓶颈不在 MoE FP4 GEMM
+
+MoE GEMM 从 CUTLASS grouped launch（120 次/token）换成 FP4 反量化 + cuBLAS（12 次 torch.mm/token），速度 0.78 vs 0.79 tok/s——完全一样。
+
+**之前的结论 "瓶颈不在 MoE GEMM" 是错误的。** 换 dequant+cuBLAS 速度没变，是因为 Python `_dequant_fp4_block` 的临时 tensor 操作本身就是大头——换了 matmul 方式但 dequant 仍然慢。
+
+Profiling 确认：**只有 `m_grouped_fp8_fp4_gemm_nt_contiguous` 和 `get_paged_mqa_logits_metadata` 经过 CDG**，其他函数（attention/einsum/hyperconnection）全被 jasl 的 Triton kernels 接管，不走 CDG。MoE grouped GEMM 占 CDG 调用时间的 >99%。
+
+---
+
+## 第十二阶段：Triton FP4 Dequant Kernel（2026-05-06）
+
+### 目标
+
+用 Triton kernel 替换 Python `_dequant_fp4_block`，消灭 FP4 反量化步骤的大量临时 tensor 操作。
+
+### Triton FP4 E2M1 Dequant Kernel
+
+新增 `consumer_deep_gemm/triton_moe.py`，核心是 `_dequant_fp4_e2m1_kernel`：
+
+- 输入：`[N, K/2] uint8`（packed E2M1）+ `[N, K/32] uint8`（E8M0 scales）
+- 输出：`[N, K] bf16`
+- 硬编码 E2M1 lookup（避免 table load），E8M0 用 `tl.exp2(e - 127)` 直接算
+- 一个 kernel 完成解包 + scale 乘法 + interleave 写出
+- 不使用 `.tile::scatter4` / TMA / tcgen05，SM120/SM121 全兼容
+
+### 单元测试
+
+```
+FP4 dequant [4096, 3584]: max_diff=0.000000 ✅
+各形状测试:
+  [    1,    64]: max_diff=0.000000 PASS
+  [   64,   128]: max_diff=0.000000 PASS
+  [ 4096,  7168]: max_diff=0.000000 PASS
+  [ 2048,  4096]: max_diff=0.000000 PASS
+
+FP4 dequant 速度:
+  Python:  3.45 ms
+  Triton:  0.22 ms
+  Speedup: 15.4x
+```
+
+### Grouped GEMM 端到端测试
+
+```
+Grouped GEMM Correctness: max_diff=0.000000 ✅
+
+FC1 [M=384, K=7168, N=4096]:
+  Python:  52.59 ms → Triton: 14.00 ms → 3.8x
+FC2 [M=384, K=2048, N=7168]:
+  Python:  26.62 ms → Triton:  6.98 ms → 3.8x
+
+Step Breakdown (Triton path):
+  FP8 dequant:      0.06 ms（Python fallback，M 小不值得优化）
+  Index ops:         0.22 ms
+  FP4 dequant ×6:   2.85 ms（Triton kernel）
+  Full (dequant+mm): 14.50 ms（torch.mm 占剩余 ~11 ms）
+```
+
+### 接入与实测
+
+修改 `gemm.py` 的 `m_grouped_fp8_fp4_gemm_nt_contiguous`，改为调用 Triton 版本。
+
+重建镜像，关闭 profiling sync（`CDG_PROFILE=0`）实测：
+
+```
+500 tokens / 300s = 1.67 tok/s ✅（干净英文输出）
+```
+
+**对比：0.79 tok/s → 1.67 tok/s，2.1× 提速。**
+
+### Profiling 对比（开 CDG_PROFILE=1，带 cuda.synchronize）
+
+| 版本 | avg ms/call | 备注 |
+|------|-------------|------|
+| Python fallback（旧） | 14.00 ms | `_dequant_fp4_block` 大量临时 tensor |
+| Triton dequant（新） | 6.89 ms | dequant 快 15×，torch.mm 仍占大头 |
+
+### 剩余瓶颈分析
+
+Triton dequant 后，CDG grouped GEMM 内部时间分布：
+- FP4 dequant: ~2.85 ms（已优化）
+- torch.mm ×6: ~11 ms（cuBLAS，6 个专家各一次 launch）
+- 索引操作: ~0.3 ms
+
+下一步方向：fused dequant+matmul Triton kernel，消灭中间 BF16 临时 tensor。
+
+---
+
+## 第十三阶段：Fused Dequant+Matmul Triton Kernel（2026-05-06）
+
+### 目标
+
+把 FP4 dequant 和 matmul 合并到一个 Triton kernel 里，消灭中间 `[N, K]` BF16 临时 tensor（每专家 ~56MB for FC1）。
+
+### 尝试过的方案
+
+1. **torch.bmm 批量化**：把 6 个专家的 mm 合成 1 次 bmm。matmul 部分快 1.56×，但 `torch.stack` 6 个 `[4096, 7168]` tensor 到 FP32（~670MB 内存分配+拷贝）完全抵消了收益。端到端反而慢 20%。**放弃。**
+
+2. **Fused Triton kernel**（采用）：`_fused_dequant_matmul_kernel` 在 kernel 内部沿 K 维分块迭代，每块加载 packed FP4 就地 dequant 成 float32，直接和 A 的对应列做 `tl.dot` 累加，不写出中间 tensor。
+
+### Fused Kernel 设计
+
+```
+D[m, n] = sum_k A[m, k] * B_dequant[n, k]
+```
+
+- Grid: `(cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+- 沿 K 维循环，每次处理 BLOCK_K=64 个值（32 packed bytes）
+- A 的偶数列（k=0,2,4,...）对应 packed byte 的 low nibble
+- A 的奇数列（k=1,3,5,...）对应 packed byte 的 high nibble
+- 分别加载 a_even/a_odd，dequant 得 low_val/high_val，做两次 `tl.dot` 累加
+- E8M0 scale 用 `tl.exp2(e - 127)` 就地计算
+- 使用 `input_precision="ieee"` 提高精度
+
+### 精度分析
+
+`tl.dot` 在 SM121 上走 tensor core，即使指定 IEEE 模式仍有累积误差：
+
+| M | N | K | rel_err | 结论 |
+|---|---|---|---------|------|
+| 1 | 32 | ≤4096 | 0.000000 | 完美 |
+| 1 | 4096 | 7168 | 0.005 | 可接受 |
+| 64 | 4096 | 7168 | ~0.02 | BF16 噪声范围 |
+
+rel_err ~2% 在 BF16（7 bit mantissa, ~0.8% 固有精度）推理中完全可接受。
+
+### Benchmark（容器内，带 cuda.synchronize）
+
+```
+FC1 [M=384, K=7168, N=4096]:
+  Dequant+mm (Triton dequant + cuBLAS): 13.95 ms
+  Fused kernel:                           6.40 ms → 2.18x
+
+FC2 [M=384, K=2048, N=7168]:
+  Dequant+mm: 7.11 ms
+  Fused kernel: 3.22 ms → 2.21x
+```
+
+### 实测结果
+
+```
+500 tokens / 267s = 1.87 tok/s ✅（干净英文输出）
+```
+
+### 速度演进
+
+| 版本 | tok/s | 相对首版 |
+|------|-------|---------|
+| Python fallback（CUTLASS grouped / dequant+cuBLAS） | 0.79 | 1.0× |
+| Triton FP4 dequant + cuBLAS mm | 1.67 | 2.1× |
+| **Fused Triton dequant+matmul** | **1.87** | **2.4×** |
+
+### 剩余瓶颈
+
+GEMM 之外的开销占比增大：jasl Triton attention/einsum、Python 调度（unique/nonzero/index_select/index_copy）。这些不在 CDG 控制范围内。
+
+### 改动文件
+
+```
+Consumer-DeepGEMM/
+├── consumer_deep_gemm/
+│   ├── triton_moe.py  (更新) — 新增 fused dequant+matmul kernel，grouped GEMM 改用 fused 路径
+│   └── gemm.py        (不变) — 入口仍调用 triton_moe
+└── tests/
+    ├── test_triton_dequant.py  — dequant 正确性 + 速度
+    ├── test_triton_grouped.py  — grouped GEMM 端到端
+    ├── test_fused_matmul.py (新增) — fused kernel 正确性 + 速度
+    └── test_fused_e2e.py    (新增) — fused grouped GEMM 端到端
+```
+
+### 当前镜像状态
+
+| 镜像 | 中文 | 英文 | 速度 | 用途 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | 英文正确 + Fused Triton kernel |
+
+---
+
+## 后续优化方向（待做）
+
+按投入产出排序：
+
+### 1. Python 调度开销优化（预估 10-20% 提速，中等难度）
+
+每次 grouped GEMM 调用有 `unique()` + 6× `nonzero()` + 6× `index_select` + 6× `index_copy_`。这些涉及 GPU→CPU 同步和小 kernel launch。优化方向：
+- 写 Triton kernel 把 gather/scatter fuse 掉
+- 缓存 row indices（连续 token 的 expert 分配变化不大）
+
+### 2. Fused kernel tile size 调优（预估 5-15%，低难度）
+
+当前 `BLOCK_M=64, BLOCK_N=32, BLOCK_K=64` 是手动选的。用 Triton `@triton.autotune` 搜索最优 tile size 可能有提升，尤其是 BLOCK_N 和 BLOCK_K 对 SM121 的 shared memory / register 使用有影响。
+
+### 3. FP8 activation dequant fuse（预估 <5%，中等难度）
+
+目前 FP8 dequant 走 Python `_dequant_fp8_block`（0.06ms/call），占比极小。Fuse 进 matmul kernel 省一次 BF16 中间 tensor 读写，但 M=384 时收益有限。
+
+### 4. jasl Triton attention/einsum（收益未知，不在 CDG 范围内）
+
+CDG profiling 只能看到 MoE GEMM（>99%），jasl 的 Triton kernels（attention、MLA、einsum、hyperconnection）不经过 CDG。如果 jasl 优化了这部分，整体速度还能上去——但那是 jasl fork 的工作。
+
+---
+
+## 技术洞见备忘
+
+### SM120 FP4/FP8 指令支持状态
+
+~~| 格式 | SM100（数据中心卡） | SM120（消费级卡） |~~
+~~|------|-------------------|-----------------|~~
+~~| BF16 matmul | 完整 | 完整 |~~
+~~| FP8 matmul | 完整（tcgen05） | 残缺（部分指令缺失） |~~
+~~| FP4 matmul | 完整（tcgen05） | 不存在 |~~
+~~| TMA 硬件搬运 | 有 | 无 |~~
+
+~~SM120 上只有 BF16 矩阵乘法是完整可用的。FP4 反量化必须一路膨胀到 BF16 再算——不是我们想膨胀，是没得选。反量化到 FP8 理论上精度足够（FP4 只有 16 个值，FP8 有 256 个值可无损表示），但 SM120 的 FP8 matmul 也不完整。~~
+
+**⚠️ 2026-05-10 更正（182 期勘误）：上表错误。** PTX ISA 9.2 文档确认 sm_121 的 INT8/FP8/FP4 tensor core mma 指令全部完整存在（`mma.sync.aligned` 族）。sm_120 缺的是 `tcgen05`/TMA/TMEM，不是 FP4/FP8 mma 指令本身。我们把 `tcgen05` 路径的不可用推广成了整个 FP4/FP8 不可用——错误的归因。更正后的表格：
+
+| 格式 | SM100（数据中心卡） | SM120（消费级卡） | 备注 |
+|------|-------------------|-----------------|------|
+| BF16 matmul | 完整 | 完整 | |
+| INT8 matmul | 完整 | **完整**（sm_80+ 就支持） | Triton `tl.dot(int8,int8)` 实测 max_diff=0.0 |
+| FP8 matmul | 完整（tcgen05） | **完整**（`mma.sync` 族，sm_89+ 就支持） | `torch._scaled_mm` 接口适配有问题，硬件没问题 |
+| FP4 matmul | 完整（tcgen05） | **完整**（`mma.sync` 族 + block_scale，sm_120f PTX 8.8+） | Marlin 算错是数据布局 bug，不是硬件缺失 |
+| TMA 硬件搬运 | 有 | 无 | 仍然正确 |
+| tcgen05 | 有 | 无 | 仍然正确 |
+
+软件栈（PyTorch `_scaled_mm`、Marlin、Triton 标准库）没适配 sm_120 的 `mma.sync` FP4/FP8 路径，我们把软件的问题归咎于硬件。详见 182 期。
+
+### DeepSeek V4 FP4 是 QAT（量化感知训练）
+
+DeepSeek V4 的 FP4 不是训练后量化（post-training quantization），而是训练时就模拟了 FP4 精度（Quantization-Aware Training）。模型训练过程中"看到"了 FP4 的量化误差，权重适应了这种误差。这意味着推理时的 FP4 反量化规则必须和训练时一致——否则模型"学会适应"的误差模式对不上。
+
+### DeepSeek V4 MoE 两阶段训练导致低容错性
+
+训练分两阶段：先独立训练 10+ 个领域专家（数学、代码、Agent、指令跟随等，各自做 SFT + RL），再通过 On-Policy Distillation 蒸馏到统一模型。256 个专家的权重是各自独立演化后再"拼"到一起的，彼此没有共享梯度历史，权重分布差异极大。
+
+MoE 稀疏激活（每 token 只用 6/256 个专家）意味着每个专家话语权极大——一个算错就没有其他专家纠偏。这解释了为什么 Marlin 在 SM120 上的"数据布局解释错误"（不是精度低，是算出垃圾）会导致英文输出全崩：踩到一个"误差被放大"的专家，60 层传播下来面目全非。
+
+### torch.bmm 批量化为什么失败
+
+6 次 torch.mm → 1 次 torch.bmm，matmul 部分快 1.56×。但 torch.stack 6 个 [4096, 7168] BF16 tensor 到 FP32 需要分配 ~670MB 连续显存并拷贝数据，这个 stack 开销比省下来的 matmul launch 开销还大。端到端反而慢 20%。教训：优化要看端到端。
+
+---
+
+## 其他 GPU 架构跑 DeepSeek V4 Flash 的可行性调研（2026-05-07）
+
+### 背景
+
+调研不同 GPU 架构上部署 V4 Flash 的可行性，特别是 8×RTX 6000 Ada（SM89）和 2×RTX 6000 Blackwell（SM122）。
+
+### 各架构部署状态汇总
+
+| GPU | 架构 | vLLM 原生 | llama.cpp/Ollama | 阻断点 |
+|-----|------|-----------|-----------------|--------|
+| B300（数据中心卡） | SM100 | ✅ 原生支持 | ✅ | 无 |
+| RTX 5090 | SM120 | ❌ Marlin 算错 | ⚠️ 单卡 32GB，需 5+ 张 | vLLM: DeepGEMM + Marlin；llama.cpp: 多卡 PCIe 不现实 |
+| DGX Spark (GB10) | SM121 | ❌ 需要 jasl fork | ❌ 单机 128GB 不够 | vLLM: 同 SM120；llama.cpp: 显存不足 |
+| RTX 6000 Blackwell (PRO) | SM122 | ❌ 大概率同 SM120 系列 | ✅ 大概率可行 | vLLM: 同 SM120 系列 |
+| H100/H200 | SM90 | ✅ 用 FP8 checkpoint | ✅ | 需要 sgl-project/DeepSeek-V4-Flash-FP8 |
+| RTX 6000 Ada / L40S | SM89 | ❌ | ✅ | vLLM: DeepGEMM 不支持 SM89 |
+| RTX 4090 | SM89 | ❌ | ⚠️ 单卡 24GB 不够 | 同上 |
+| A100/A800 | SM80 | ❌ | ⚠️ | DeepGEMM + FP8 都不支持 |
+
+### vLLM 在非 SM100 架构上的核心阻断点
+
+V4 Flash 的 vLLM 推理路径硬性绑定了两个组件：
+
+1. **DeepGEMM**：`tf32_hc_prenorm_gemm`（hyperconnection）和 `fp8_einsum`，C++ 层硬编码只认 SM90 和 SM100。SM89/SM120 系列都会直接 `RuntimeError: Unsupported architecture`
+2. **Marlin MXFP4 MoE**：SM120 系列上计算结果部分错误（静默错误），SM89 上能跑但 DeepGEMM 先挡住了
+
+jasl/vllm fork 用 Triton 重写了 DeepGEMM 路径（attention/MLA/hyperconnection），解决了阻断点 1；但 MoE FP4 GEMM 仍走 Marlin（阻断点 2 未解决），导致英文输出垃圾。
+
+Consumer-DeepGEMM 用 fused Triton dequant+matmul 解决了阻断点 2（中英文均正确），但速度只有 1.87 tok/s。
+
+### 8×RTX 6000 Ada（SM89）方案
+
+**vLLM 跑不了。** DeepGEMM 不认 SM89，连模型加载都过不去。`VLLM_USE_DEEP_GEMM=0` 也绕不过——hyperconnection 是独立代码路径。社区有人问过"8×L40S 能不能跑 V4 Flash"（vLLM Forums），没有成功回复。
+
+**llama.cpp/Ollama 可行。** 8×48GB = 384GB 独立显存，Q4_K_M ~160GB 按层分配到 8 张卡，每张才 ~20GB。SM89 是 llama.cpp 的主流支持架构。
+
+推荐路径：`ollama run deepseek-v4-flash`。
+
+### 2×RTX 6000 Blackwell PRO（SM122）方案
+
+**vLLM 大概率同 SM120 系列一样的坑**（DeepGEMM + Marlin），需要 jasl fork 类似的处理。
+
+**llama.cpp/Ollama 大概率可行。** 2×96GB = 192GB，放 156GB nsparks FP4-FP8 GGUF 绰绰有余。SM120 系列前向兼容（SM120 编译的 kernel 在 SM121 上能跑已验证，SM122 同理）。单机两卡，不需要分布式。
+
+推荐路径：nsparks/DeepSeek-V4-Flash-FP4-FP8-GGUF + llama.cpp。
+
+### GGUF 资源汇总
+
+| Repo | 量化 | 大小 | 说明 |
+|------|------|------|------|
+| [nsparks/DeepSeek-V4-Flash-FP4-FP8-GGUF](https://huggingface.co/nsparks/DeepSeek-V4-Flash-FP4-FP8-GGUF) | FP4+FP8 原生精度 | ~156GB | 精度最高，和官方权重一致 |
+| [Preyazz/DeepSeek-V4-Flash-GGUF](https://huggingface.co/Preyazz/DeepSeek-V4-Flash-GGUF) | Q2_K / Q3_K_M / Q4_K_M | ~100-160GB | 下载量最大 |
+| [antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf) | IQ2_XXS | ~87GB | Redis 作者，极致压缩 |
+
+注意：上游 llama.cpp（ggml-org）尚未正式合并 V4 架构支持（截至 2026-05-07）。需要用 fork 或 Ollama（内置自己的 llama.cpp fork，已支持 V4）。
+
+antirez fork：https://github.com/antirez/llama.cpp-deepseek-v4-flash
+
+### 为什么 DGX Spark 不能走 GGUF 路径
+
+DGX Spark 是统一内存架构，单机 128GB 放不下 156GB 的 GGUF 模型。双机组分布式 Ollama/llama.cpp 不支持。所以 DGX Spark 只能走 vLLM 双机 TP=2 路径，这也是 Consumer-DeepGEMM 和 jasl fork 存在的原因。
+
+### 关键认知：SM120 系列的尴尬地位
+
+SM120/121/122（消费级 Blackwell）处于一个完美的夹缝中：
+- ~~**比 SM89 强**：有部分 FP4/FP8 硬件指令~~ **⚠️ 2026-05-10 更正**：不是"部分"，INT8/FP8/FP4 mma 指令全部完整（mma.sync 族）。缺的是 tcgen05/TMA/TMEM
+- **比 SM100 弱**：缺 TMA、缺 tcgen05——这些影响峰值吞吐，不影响功能有无
+- **结果**：数据中心卡的生态（vLLM/DeepGEMM）不认它，消费卡的生态（llama.cpp）还在追赶——**但这是软件适配问题，不是硬件能力问题**
+- DeepGEMM 明确不打算支持 SM120 系列（绑定 tcgen05）
+- Triton 标准 FP4 MoE kernel 在 SM120 上编译失败（生成 tcgen05 体系的 `.tile::scatter4` 指令，而非 mma.sync 族）
+- Marlin 的 FP4 数据布局按 sm_100 tcgen05 解释，在 sm_120 mma.sync 上算错
+
+**Consumer-DeepGEMM 是目前全世界唯一在 SM120 系列上正确运行 V4 Flash FP4 MoE 的方案。**（christopherowen 的 CUTLASS 方案也正确，但他只适配了 GPT-OSS-120B，没有 V4 模型层）
+
+### NVFP4 vs MXFP4：不能互转
+
+调研过"把 V4 Flash 的 MXFP4 权重转成 NVFP4，走 vLLM 已有的 SM120 NVFP4 路径"的可行性。**结论：走不通。**
+
+| | NVFP4 | MXFP4（V4 用的） |
+|---|---|---|
+| Block size | 16 | 32 |
+| Scale 格式 | FP8 E4M3 + FP32 per-tensor（两级） | E8M0 per-block（一级） |
+| 标准 | NVIDIA 私有 | OCP 开放标准 |
+
+值都是 E2M1，但 scale 机制完全不同——不是换壳，是重新量化。V4 是 QAT 训练的，重新量化成 NVFP4 会破坏训练时适配的误差模式。
+
+vLLM 的 FlashInfer b12x backend（PR #40082，meena-at-work）确实在 SM120 上支持了 NVFP4 MoE，但只对 NVFP4 模型有效（GLM-5.1、Nemotron 等），和 V4 Flash 的 MXFP4 无关。
+
+### 重大发现：christopherowen/spark-vllm-mxfp4-docker（2026-05-07 调研）
+
+搜索过程中发现了一个关键社区项目：
+
+- **christopherowen/spark-vllm-mxfp4-docker**
+- 专门为 SM121 写了 **CUTLASS block-scaled MXFP4 MoE GEMM kernel**
+- 在 GPT-OSS-120B 上实测 **72 tok/s**（TP=2 RDMA）
+- 有自己的 CUTLASS fork（`mxfp4_v2` 分支）和 vLLM fork（`mxfp4_v2` 分支）
+- 新增 `--mxfp4-backend` 和 `--mxfp4-layers` 配置参数
+- Tile 选择：64×128（decode, PingPong）、128×128（prefill, Cooperative）
+
+链接：
+- Docker 构建：https://github.com/christopherowen/spark-vllm-mxfp4-docker
+- vLLM fork：https://github.com/christopherowen/vllm/tree/mxfp4_v2
+- CUTLASS fork：https://github.com/christopherowen/cutlass/tree/mxfp4_v2
+
+**这正好是 Consumer-DeepGEMM 想做但没做到的事**——正确的 MXFP4 MoE GEMM，在 SM121 上，跑得快。GPT-OSS-120B 的 MoE 结构和 V4 Flash 同属 MXFP4 标准格式，理论上应该兼容。
+
+### christopherowen 方案验证结果（2026-05-07）
+
+#### 构建过程
+
+1. eugr/spark-vllm-docker 已集成 christopherowen 方案（`Dockerfile.mxfp4` + `--exp-mxfp4` 参数）
+2. Docker BuildKit 不走 TUN，需要宿主机预先 clone 所有依赖：
+   - christopherowen 三件套：vllm fork、flashinfer fork、cutlass fork
+   - vLLM CMake FetchContent 5 个依赖：nvidia/cutlass v4.2.1、triton v3.5.0、qutlass、FlashMLA、flash-attention（含 csrc/cutlass submodule）
+3. Dockerfile.mxfp4 改动：git clone → COPY 本地源码，跳过 flashinfer-cubin（5299 cubin 下载太慢，JIT 替代）
+4. 构建成功，20 分钟
+
+#### ShellCrash TUN 模式配置（顺便搞通了）
+
+- **配置文件位置**：`/etc/ShellCrash/`（systemd 以 root 运行，不是 `~/.local/share/ShellCrash/`）
+- `redir_mod=Tun模式`（在 `/etc/ShellCrash/configs/ShellCrash.cfg`）
+- **`auto-route: true`**：改了 `/etc/ShellCrash/start.sh` 第 466 行（原版硬编码 `auto-route: false`，Docker 容器流量不走 TUN）
+- TUN 开了之后 Docker 容器可直接访问 GitHub，但 BuildKit 构建时仍不稳定（CMake FetchContent 136 秒超时），所以仍然用 COPY 方案
+
+#### 测试结果
+
+**christopherowen 原版 fork 不能跑 V4 Flash**：
+- `TransformersMoEForCausalLM has no vLLM implementation, falling back to Transformers implementation`
+- christopherowen 的 vllm fork 没有 `deepseek_v4` 模型实现——他只做了 kernel 层，模型层适配只针对 GPT-OSS-120B
+- 升级 transformers 5.x 后 transformers 后端尝试加载 280B 模型，slave 心跳超时
+
+#### 混合方案尝试（jasl vllm + christopherowen flashinfer）
+
+**尝试 1：替换 flashinfer**
+- 构建 `vllm-node-jasl-cofi`：用 christopherowen flashinfer 编译 wheel + jasl vllm
+- 结果：中文 ✅ 14.5 tok/s，英文 ❌ 开头垃圾——和纯 jasl 一模一样
+- 原因：MoE FP4 backend 选择逻辑在 **vllm 侧**（oracle/mxfp4.py），flashinfer 只是提供了 kernel，vllm 不知道要调用它
+
+**尝试 2：Patch vllm 的 backend 选择逻辑**
+- 在 jasl 的 `utils/flashinfer.py` 加了 `has_flashinfer_sm12x_cutlass_moe()` 检测函数
+- 在 jasl 的 `oracle/mxfp4.py` 优先级列表加了 `FLASHINFER_CUTLASS_MXFP4_MXFP8`
+- 结果：backend 成功选择 `FLASHINFER_CUTLASS_MXFP4_MXFP8` ✅
+- 但 `convert_weight_to_mxfp4_moe_kernel_format` 报错：`Unsupported mxfp4_backend for Mxfp4MoEMethod: FLASHINFER_CUTLASS_MXFP4_MXFP8. Expected TRTLLM or Triton backend.`
+- 原因：jasl 的权重转换函数不认识 CUTLASS backend——整条链路（权重 reformat、forward dispatch）都需要从 christopherowen 移植，不是加几行能搞定的
+
+#### 结论
+
+christopherowen 的 MXFP4 方案是**完整的三层联动**：
+- CUTLASS fork：SM12x FP4 native MMA tile kernel（PingPong/Cooperative）
+- flashinfer fork：`cutlass_fused_moe` 调用 CUTLASS kernel
+- vllm fork：backend 选择 + 权重转换 + forward dispatch
+
+**简单 patch 移植走不通**——两个 vllm fork（jasl 和 christopherowen）的代码结构差异太大。正确路径是**学习 christopherowen 的 CUTLASS 用法，在 Consumer-DeepGEMM 里用硬件指令替代软件模拟**。
+
+#### Consumer-DeepGEMM vs christopherowen 的本质区别
+
+| | Consumer-DeepGEMM | christopherowen |
+|---|---|---|
+| 计算方式 | FP4 → dequant BF16 → torch.mm | FP8 × FP4 → **native SM12x MMA** |
+| 中间 tensor | 有（BF16 临时 tensor） | 无（硬件直接做 block-scaled 乘累加） |
+| 速度 | 1.87 tok/s | 72 tok/s（GPT-OSS-120B） |
+| 瓶颈 | 临时 tensor 分配 + 读写 | 无（计算密集） |
+
+SM12x **有** FP4 tensor core（基础 MMA 指令），没有的是 tcgen05 和 TMA。之前判断"SM120 没有 FP4 matmul"是错误的。
+
+#### 下一步：Consumer-DeepGEMM 升级路线
+
+学习 christopherowen 三个 fork 的 diff，把 Consumer-DeepGEMM 的 native 路径从 dequant+torch.mm 升级到 native FP4 MMA：
+
+1. **cutlass fork vs 官方**（`christopherowen/cutlass` mxfp4_v2 分支）：SM12x FP4 MMA 用了哪些 CUTLASS 模板和 PTX 指令
+2. **flashinfer fork vs 官方**（`christopherowen/flashinfer`）：`cutlass_fused_moe` 怎么调用 kernel、activation FP8 quantize 怎么做
+3. **vllm fork 的权重转换**（`christopherowen/vllm` mxfp4_v2 分支）：MXFP4 权重怎么 reformat 给 CUTLASS 吃
+
+目标：Consumer-DeepGEMM 从 1.87 tok/s → 两位数。
+
+#### 当前可用镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 用途 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | 中文日常使用 |
+| `vllm-node-sm121-cdg:latest` | ✅ | ✅ | 1.87 tok/s | 英文正确性验证 |
+| `vllm-node-mxfp4:latest` | — | — | — | christopherowen 原版，不支持 V4 |
+| `vllm-node-jasl-cofi:latest` | ✅ | ❌ | 14 tok/s | 混合实验，效果同 jasl |
+
+另外还搜到 NVIDIA 论坛上有人发了**单机 GB10 跑 V4 Flash MXFP4 的自定义 C++ runtime**，余弦相似度 0.9994-0.9999，已发布 v0.1.0 prerelease。decode bandwidth-bound。
+
+---
+
+## 第十四阶段：FP8/FP4 Tensor Core + dot_scaled 优化（2026-05-10）
+
+### 背景
+
+182 期公众号勘误过程中发现 sm_121 的 INT8/FP8/FP4 tensor core mma 指令全部完整存在（PTX ISA 9.2 确认）。之前"FP4 硬件不存在""FP8 残废"是错误归因——把 tcgen05 路径不可用推广成了整个 FP4/FP8 不可用。
+
+### 验证过程
+
+#### 1. INT8 tensor core（已有，NLA 项目验证）
+
+`tl.dot(int8, int8)` max_diff=0.0。详见 NLA 项目 `int8_linear.py`。
+
+#### 2. FP8 tensor core（新验证）
+
+```
+test_fp8_dot.py: tl.dot(float8e4nv, float8e4nv) max_diff=0.0 ✅
+```
+
+sm_121 上 FP8 mma 从 sm_89 就支持，完全没问题。
+
+#### 3. FP4→FP8 fused kernel
+
+把 `_fused_dequant_matmul_kernel` 里的 FP4→float32→`tl.dot(f32,f32)` 换成 FP4→FP8（无损）→`tl.dot(fp8,fp8)`。
+
+- E2M1→FP8 E4M3 转换用算术拼 bit：`(sign<<7)|(e<<3)|m`，16 个值全部无损映射
+- even/odd concat 到 K=32 满足 `tl.dot` 最小要求
+- 按 scale block 粒度迭代，E8M0 scale 精确无近似
+
+```
+Correctness: rel_err=2.77% (BF16 精度范围内)
+Speed: FC1 5.16ms→3.64ms (1.43x), FC2 2.58ms→1.79ms (1.44x)
+端到端 V4 Flash: 1.87→2.0 tok/s（kernel 快了但瓶颈在 Python 调度）
+```
+
+#### 4. tl.dot_scaled（关键发现）
+
+Triton 3.6 有 `tl.dot_scaled` API，原生支持 MXFP4 格式——`lhs_format="e4m3", rhs_format="e2m1"`。
+
+- 不需要手动 dequant、不需要拆 even/odd、不需要拼 FP8
+- Triton 内部一步到位：FP4 解包 + scale 应用 + matmul
+- SM120 上 fallback 到 bf16 emulation（Triton issue #7550），不是 native FP4 MMA，但结果完全正确
+
+```
+test_dot_scaled.py: dot_scaled e2m1×e2m1 max_diff=0.0000 ✅（零误差！）
+test_dot_scaled_mixed.py: dot_scaled e4m3×e2m1 编译运行成功 ✅
+
+Speed benchmark (tests/test_dot_scaled_fused.py):
+  FC1 [384x7168x4096]: float32=5.16ms → dot_scaled=0.69ms (7.5x)
+  FC2 [384x2048x7168]: float32=2.58ms → dot_scaled=0.32ms (8.1x)
+```
+
+**kernel 快了 7.5x，零误差。**
+
+#### 5. 调度优化
+
+原来的 `m_grouped_fp8_fp4_gemm_nt_contiguous_triton` 每次调用：
+- `unique()` + 6× `nonzero()` = 7 次 GPU→CPU sync
+- 6× `index_select` + 6× `index_copy_` = 12 次 GPU kernel
+- 120 次/token = ~1560 次 sync
+
+优化后：
+- `argsort` + diff + 1× `nonzero` = 2 次 GPU→CPU sync
+- 1× `index_select`（所有有效行一次取出，per-expert 用 slice 零拷贝）
+- 1× `index_copy_`（一次性 scatter 回去）
+- 120 次/token = ~240 次 sync
+
+### 端到端实测结果
+
+```
+英文 "What is quicksort? Explain with code."
+→ 500 tokens / 237s = 2.11 tok/s ✅ 干净英文，零垃圾
+
+中文 "请用500字介绍万里长城"
+→ 464 tokens / 230s = 2.0 tok/s ✅（FP8 fused 版本）
+```
+
+### 速度演进（全部中英文正确）
+
+| 版本 | tok/s | 相对首版 | kernel 时间 |
+|------|-------|---------|------------|
+| Python fallback + CUTLASS | 0.79 | 1.0x | 14.0 ms |
+| Triton dequant + cuBLAS | 1.67 | 2.1x | 6.89 ms |
+| Fused dequant+matmul（float32） | 1.87 | 2.4x | 5.16 ms |
+| FP8 fused | 2.0 | 2.5x | 3.64 ms |
+| **dot_scaled + 调度优化** | **2.11** | **2.7x** | **0.69 ms** |
+
+kernel 从 14.0ms 降到 0.69ms（20x），端到端从 0.79 到 2.11（2.7x）。差距说明**瓶颈已完全转移到 Python 调度开销**——kernel 时间只占端到端的 ~4%，剩余 96% 是 Python 循环 + GPU↔CPU sync + 小 tensor 分配。
+
+### 剩余瓶颈
+
+每 token ~475ms 中：
+- dot_scaled kernel: ~0.69ms × 120 = ~83ms（17%）
+- FP8 activation dequant: ~0.06ms × 120 = ~7ms（1.5%）
+- Python 调度 + sync: ~385ms（81%）——argsort/nonzero/index_select/index_copy/for 循环
+
+### Dispatch profiling（确认瓶颈分布）
+
+```
+test_dispatch_profile.py（模拟真实 V4 decode: M=384, K=7168, N=4096, 6 experts）:
+  1_argsort:           0.016 ms   1.1%
+  2_valid_mask+item:   0.018 ms   1.3%
+  3_diff+nonzero:      0.038 ms   2.8%
+  4_cpu_transfer:      0.018 ms   1.3%
+  5_index_select:      0.009 ms   0.7%
+  6_kernels_x6:        1.187 ms  87.4%  ← 6 次 kernel launch
+  6b_single_kernel:    0.167 ms  12.3%
+  7_index_copy:        0.011 ms   0.8%
+  FULL_dispatch:       1.358 ms 100.0%
+  Per token (×120):    163 ms = 6.14 tok/s（理论上限）
+```
+
+理论 6.14 tok/s vs 实测 2.2 tok/s = 2.8x 差距在 CDG 之外（vLLM shim 层、FP8 dequant 等）。
+
+### jasl 基线重测（2026-05-10）
+
+```
+jasl 原版（无 CDG）:
+  中文 "请用500字介绍万里长城": 464 tokens / 33s = 14.1 tok/s ✅
+  英文 "What is quicksort?":   500 tokens / 35s = 14.3 tok/s ❌ 纯垃圾（后半自救）
+
+CDG dot-scaled（多次测速，稳定）:
+  中文 ×3: 428-500 tokens / 203-218s = 2.11-2.29 tok/s ✅
+  英文 ×3: 500 tokens / 217-218s = 2.29-2.30 tok/s ✅
+```
+
+差距确认：jasl 14 tok/s vs CDG 2.2 tok/s = **6.4x**。CDG kernel 不是瓶颈（只占 17%），瓶颈在 CDG shim 层拦截的其他路径。
+
+### christopherowen CUTLASS patch 尝试（失败）
+
+**目标**：cherry-pick christopherowen 对 CUTLASS 的 3 个文件 61 行改动，让 tile 从 128×128 降到 64×128（decode 小 M 场景 19% 加速）。
+
+**改了什么**：
+1. `sm120_blockscaled_mma_builder.inl`：static_assert `>=32` → `>=8 && %8==0`，`size/Blk_MN` → `ceil_div`
+2. `sm120_blockscaled_mma_tma.hpp`：TMA SFA/SFB 描述符 M/N pad 到 128
+3. `sm120_blockscaled_mma_array_tma.hpp`：同上
+
+**结果**：编译失败（24 errors）。核心错误：`"TMA requires CTA_Tile and SLayout top-level size equivalence"`。
+
+**根因**：我们的 CUTLASS 是 DeepGEMM 自带的旧版本，christopherowen 用的是 v4.4.2。两个版本的 TMA layout 构造（`copy_traits_sm90_tma.hpp`）内部实现不同，他的 patch 只改了 3 个 blockscaled 文件但依赖 v4.4.2 的 TMA 基础设施。**直接 cherry-pick 不行，需要整体升级 CUTLASS 到 v4.4.2——工作量大，且要验证和 DeepGEMM/PyTorch 的兼容性。**
+
+tile 改回 128×128，CUTLASS patch 全部回退。
+
+### Marlin FP4 bug 根因分析（2026-05-10）
+
+追到了 Marlin 的 CUDA 源码。bug 不在 `dequant.h` 的数学运算——bit manipulation 本身是正确的。
+
+**问题在权重 permutation**：`marlin_utils_fp4.py` 的 `marlin_permute_scales` + kernel 内部的 `frag_b[0]/frag_b[1]` reverse indexing 是按 sm_80/sm_90 的 `mma.sync` 寄存器→矩阵元素映射设计的。sm_120 的 `mma.sync` 指令格式一样，但寄存器映射可能不同——同一个 `frag_b[0]` 在不同架构上对应矩阵的不同位置。
+
+关键文件：
+- `csrc/quantization/marlin/dequant.h` 第 398-471 行：FP4 E2M1 dequant（数学正确）
+- `csrc/quantization/marlin/dequant.h` 第 551-562 行：E8M0 scale dequant（`dequant_fp8_scales`）
+- `vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py`：权重 permutation 和 scale reorder
+- `csrc/moe/marlin_moe_wna16/marlin_template.h`：MoE kernel 主体
+
+**要修的是 permutation 表**，不是 dequant 函数。需要实验确认 sm_120 的 FP4 `mma.sync.aligned.m16n8k64` 的 fragment layout（寄存器→矩阵元素映射）。NVIDIA Developer Forums 上有人在 2026-03 问了这个问题（fragment layout for e2m1 block scaling on sm120），至今无人解答。
+
+**另一个方向**：不修 Marlin，而是在 jasl fork 里把 MoE backend 从 Marlin 换成 CDG 的 `dot_scaled` 路径——保持 jasl 的 14 tok/s attention/MLA 路径，只替换 MoE GEMM。但需要解决 CDG shim 层拦截过多路径的问题。
+
+### 🔥 Marlin sm_120 bug 根因确认：ldmatrix 行为差异（2026-05-10）
+
+**逐层排除**：
+1. ✅ FP4 E2M1 → FP8 E4M3 dequant（bit manipulation 正确，架构无关）
+2. ✅ E8M0 scale dequant（sm_121 上测试通过，V4 真实 scale 范围 119-122 全 OK）
+3. ✅ FP8 `mma.sync.aligned.m16n8k32` fragment layout（PTX ISA 文档确认 sm_89+ 通用）
+4. ✅ FP4 `mma.sync.aligned.m16n8k64` fragment layout（PTX ISA 文档确认，和 sm_80 的 u4/s4 同族）
+5. ❌ **`ldmatrix.sync.aligned.m8n8.x4.shared.b16` 在 sm_121 上的行为和 sm_80/sm_90 不同！**
+
+**实验验证**（`test_ldmatrix_sm121.cu`）：
+
+共享内存填 `smem[i] = i`（0-255），用 `ldmatrix.sync.aligned.m8n8.x4.shared.b16` 加载，dump 每个线程拿到的值：
+
+```
+sm_80/sm_90 预期行为（行列交错分组）：
+  Thread 0: frag[0] = [0, 1]     （row 0, cols 0-1）
+  Thread 1: frag[0] = [8, 9]     （row 1, cols 0-1）
+  Thread 8: frag[0] = [2, 3]     （row 0, cols 2-3）
+  ...
+  → ldmatrix 做行列重排，把 8x8 矩阵按 tensor core fragment layout 分配到线程
+
+sm_121 实际行为（线性顺序）：
+  Thread 0: frag[0] = [0, 1]
+  Thread 1: frag[0] = [2, 3]
+  Thread 2: frag[0] = [4, 5]
+  ...
+  Thread 31: frag[0] = [62, 63]
+  → ldmatrix 不做重排，每个线程按 lane ID 顺序拿连续的 2 个 uint16
+```
+
+**31/32 个线程的 frag[0] 和预期不同**（只有 T0 和 T31 碰巧对齐）。
+
+**根因解释**：Marlin 假设 `ldmatrix` 会做 sm_80/90 风格的行列交错重排，按那个假设在共享内存里排列权重数据。但 sm_121 的 `ldmatrix` 不做那个重排——数据按线性顺序进寄存器。结果：mma 指令拿到的 fragment 里，矩阵元素位置全错了。不是"精度低"，是**矩阵的行列被彻底打乱**——解释了为什么输出是垃圾而不是"稍有偏差"。
+
+**修复方向**：
+1. **在 Marlin 的共享内存写入端做逆变换**——按 sm_121 的 ldmatrix 行为（线性）重新排列共享内存里的数据，让 ldmatrix 加载后的寄存器内容和 sm_80/90 的结果一致
+2. **或者在 Marlin 的寄存器端做后处理**——ldmatrix 加载后用 shuffle 指令重排寄存器
+3. **或者绕过 ldmatrix**——用普通的 `ld.shared` 加载 + 手动分配到寄存器（性能可能差）
+
+方向 1 最干净——只需要改共享内存的写入 pattern，不动 mma 和 dequant 逻辑。需要推导 sm_121 `ldmatrix` 的完整映射公式，然后生成对应的 permutation 表。
+
+### shfl fix 尝试（失败，2026-05-10 下午）
+
+**问题 1：sm_80 PTX JIT 导致 fix 被跳过**
+
+最初的 fix 用 `#if __CUDA_ARCH__ >= 1200`，但 Marlin MoE 编译为 `8.0+PTX`（CMakeLists.txt 第 1084 行 `MARLIN_MOE_ARCHS "8.0+PTX"`），JIT 到 sm_121 时 `__CUDA_ARCH__` = 800，条件不命中。
+
+**解法**：CMakeLists.txt 加 `12.0;12.1` 到 `MARLIN_MOE_ARCHS`，让 Marlin MoE 也编译 sm_120 native cubin。验证：`cuobjdump -lelf _moe_C.abi3.so` 显示 27 个 `sm_120.cubin`。
+
+**问题 2：shfl fix 正向/反向都让输出更差**
+
+| 版本 | 英文输出 |
+|------|---------|
+| jasl 原版（sm_80 PTX JIT） | 开头垃圾，后半自救 |
+| shfl fix 正向 `(laneid%8)*4 + laneid/8` | **完全空白** |
+| shfl fix 反向 `(laneid%4)*8 + laneid//4` | **完全空白** |
+| fix 回退（sm_120 native 但无 shfl） | 恢复"开头垃圾后自救" |
+
+**分析**：ldmatrix 在 sm_121 上的行为差异（测试验证了 128/128）是真的，但 Marlin 的共享内存有 **swizzle pattern**（防 bank conflict），不是简单的连续布局。我们的 ldmatrix 测试用的是 `smem[i] = i`（连续），但 Marlin 实际的 smem 布局经过了 swizzle。shfl fix 在连续布局上验证正确，但在 swizzle 后的布局上反而打乱了数据。
+
+**更深层的问题**：sm_80 PTX JIT 到 sm_121 时，ldmatrix 行为变了，但 `gptq_marlin_repack`（权重预处理，也是按 sm_80 假设做的）的 swizzle 排列**恰好部分补偿了** ldmatrix 的变化——不是完美补偿（否则英文也对），但够用到中文能跑、英文能自救。shfl fix 打破了这个"凑巧的补偿"。
+
+**结论**：修复不能简单加 shfl——需要搞清楚 Marlin 的 smem swizzle pattern，然后在 swizzle 后的布局上做正确的 ldmatrix 补偿。这是一个更复杂的问题。
+
+### shfl fix 在 PTX JIT 模式下也失败（无条件 shfl，sm_80 PTX）
+
+回退 sm_120 native 编译（恢复 `MARLIN_MOE_ARCHS "8.0+PTX"`），直接无条件 shfl。结果：**也是完全空白**。
+
+**结论：shfl fix 方向错误。** 不管 native 还是 PTX JIT，加 shfl 都让输出崩溃。我们的 ldmatrix 测试可能有 bug，或者 ldmatrix 行为差异不是 Marlin 乱码的原因——Marlin 的 sm_80 PTX JIT + sm_121 ldmatrix 的组合是"部分工作"的状态，shfl 打破了这个部分补偿。
+
+### ldmatrix 追加校准（2026-05-11）
+
+前面的“sm_121 `ldmatrix` 不看 per-lane 地址、只线性读”说法过强。新的 `test_ldmatrix_address_probe.cu` 证明：
+
+- `ldmatrix.sync.aligned.m8n8.x4.shared.b16` 在 sm_121 上仍然使用 per-lane shared address。
+- x4 被拆成 4 个 8-lane address group：`frag0` 用 lane 0-7 的地址，`frag1` 用 lane 8-15，`frag2` 用 lane 16-23，`frag3` 用 lane 24-31。
+- 差异在 group 内的 lane→元素分配：sm_121 实际近似为 `src_addr_lane = frag*8 + lane/4, offset = 2*(lane%4)`；sm_80/90 预期是 `src_addr_lane = frag*8 + lane%8, offset = 2*(lane/8)`。
+- 因此连续 row-address probe 上的补偿 shfl 公式仍是 `src_lane = (lane%8)*4 + lane/8`。
+
+进一步用 `test_marlin_a_ldmatrix_swizzle.cu` 把 Marlin 的 A 侧 `transform_a()` / `a_sh_rd_trans` 加进去验证：
+
+| 配置 | raw vs sm80 oracle | shfl vs sm80 oracle |
+|---|---:|---:|
+| large 64x256, moe_block=64, linear fill | 120/128 mismatch | 0/128 mismatch |
+| large 64x256, moe_block=64, Marlin `transform_a` fill | 120/128 mismatch | 0/128 mismatch |
+| large 64x128, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+| large 128x64, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+| small 128x128, moe_block=64 | 120/128 mismatch | 0/128 mismatch |
+
+结论修正：**Marlin A 侧 shared swizzle 不会破坏这个 shfl 补偿。** 之前 “shfl fix 空白” 不能再归因于 A 侧 `transform_a`。更可能的解释是：A fragment 被修到 sm80 oracle 后，B/scale/permutation 侧仍按另一套布局错位，原本的局部补偿被拆掉，输出直接崩。下一步应验证 FP4 B dequant 后的 `FragB` / `mma.sync` 寄存器布局，而不是继续只盯 A 侧 `ldmatrix`。
+
+### B fragment 方向切换（2026-05-11）
+
+新增 `test_mma_b_fragment_layout.cu`，用同一个 A fragment 做对照：
+
+- A 从 shared identity matrix 用 `ldmatrix.x4` 读取，并套用 A 侧 shfl 修正。
+- B reference 用 `ldmatrix.x2.trans` 从 shared 读取，作为 tensor core 接受的 BF16 B fragment oracle。
+- B manual 用 Marlin 风格的两个 BF16 pair 寄存器直接喂给 `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`。
+
+结果：
+
+```text
+mma output diff: ref vs manual_a = 32 / 128
+mma output diff: ref vs manual_b = 32 / 128
+
+lane 0 ref0=[1,101] ref1=[800,900] manual0=[1,2] manual1=[3,4]
+lane 1 ref0=[201,300] ref1=[1000,1104] manual0=[5,6] manual1=[7,8]
+...
+```
+
+含义：B operand 的寄存器布局不是 lane 连续的 `[lane*4+1..lane*4+4]`，也不是简单交换 `b[0]/b[1]`。Marlin B 侧实际路径是：
+
+`gptq_marlin_repack` → kernel 里 `int4* sh_b_stage` → `frag_b_quant[k][0][j]` → `dequant<bf162, FE2M1f>` 的 reverse indexing → `mma`。
+
+因此下一步应做 **repack 级 tile probe**：构造 16×64 的可控 4-bit weight tile，复刻 `gptq_marlin_repack_kernel` 的 `tc_row/tc_col/tc_offsets/pack_idx`，再检查每个 lane 的 `b_quant_0/b_quant_1` 经 dequant 后是否等价于 B reference fragment。A 侧已经不是主嫌。
+
+追加：`test_marlin_fp4_dequant_order.cu` 直接 dump 了 `dequant<nv_bfloat162, FE2M1f, true>` 的 nibble 消费位置。它只读取输入 word 的 nibble 2/3/6/7；但 MXFP4 分支实际是：
+
+```cpp
+b_quant_1 = frag_b_quant[k][0][j];
+b_quant_0 = b_quant_1 << 8;
+```
+
+所以 `b_quant_0` 消费原 word 的 nibble 0/1/4/5，`b_quant_1` 消费原 word 的 nibble 2/3/6/7。结合 `gptq_marlin_repack` 的 `pack_idx = {0,2,4,6,1,3,5,7}`，B 侧顺序正好恢复成：
+
+- `frag_b0[0] = [k0,n], [k1,n]`
+- `frag_b0[1] = [k8,n], [k9,n]`
+- `frag_b1[0] = [k0,n+8], [k1,n+8]`
+- `frag_b1[1] = [k8,n+8], [k9,n+8]`
+
+这和 `ldmatrix.x2.trans` 的 B fragment oracle 对齐。当前判断：**B 核心 nibble/repack/dequant 顺序不是主嫌**。
+
+### A-shfl 补丁重试与构建阻塞（2026-05-11）
+
+基于 A/B probe，重新把最小 A 侧补偿打到 `spark-vllm-docker/vllm-sm120/csrc/moe/marlin_moe_wna16/marlin_template.h` 的 `ldsm<count==4>`：
+
+```cpp
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+int lane = threadIdx.x & 31;
+int src_lane = (lane % 8) * 4 + lane / 8;
+a[0] = __shfl_sync(0xffffffff, a[0], src_lane);
+...
+#endif
+```
+
+这次只动 A operand 的 `ldmatrix.x4`，不碰 B、scale、repack、`count==2`。
+
+为了验证真实 vLLM 路径，修了 `rebuild_moe_c.sh`：
+
+- include 改为绝对 `csrc`
+- 加入容器内 CUTLASS include：`flashinfer/data/cutlass/include`
+- 加入 `.deps/vllm-flash-attn-src/csrc/cutlass/tools/util/include`
+- 解除 PyTorch extension 默认的 BF16/half conversion 禁用
+- 构建前生成 `csrc/moe/marlin_moe_wna16/kernel_selector.h`
+
+结果：对象编译能走到 30/30，但最终链接失败，大量 `Marlin<...>` specialization undefined。原因是这个 `torch.utils.cpp_extension` 快速脚本没有复刻 vLLM CMake 对 Marlin specialization 的完整生成/链接规则。脚本已改成 `generate_kernels.py 8.0,12.1`，但尚未重新完整验证。
+
+当前状态：**源码层 A-shfl 补丁已存在，但没有真实服务验证；不能记为有效优化。** 下一步要么继续修快速重编脚本的 specialization 集合，要么放弃脚本，走原 vLLM CMake build 生成 `_moe_C`。
+
+### 关键发现：`__CUDA_ARCH__ < 890` 的 FP8 guard（第 296-298 行）
+
+```cpp
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+if constexpr (a_type_id == vllm::kFE4M3fn.id()) return;
+#endif
+```
+
+sm_80 PTX 编译时 `__CUDA_ARCH__` = 800 < 890 → FP8 activation 的 kernel 直接 return。V4 Flash 的 activation 实际是 **BF16**（`get_marlin_input_dtype()` 默认返回 None，不做 FP8 量化），走 BF16 mma 路径。sm_120 native 编译时 `__CUDA_ARCH__` = 1200 > 890，FP8 路径被启用——但其他代码没适配，导致全崩。
+
+### oracle 内部路径分析（2026-05-10）
+
+在 jasl fork 内部强制 oracle 选 `DEEPGEMM_MXFP4` backend（修改 `mxfp4.py` 的两个 `select` 函数），安装 Consumer-DeepGEMM。结果：
+
+- **英文完美，零垃圾** ✅（验证 Marlin 确实是乱码根因）
+- **速度 2.1 tok/s**（和之前 CDG 镜像一样）
+
+**`DeepGemmFP4Experts.apply()` vs Marlin `_fused_marlin_moe` 路径对比**：
+
+| 步骤 | Marlin (14 tok/s) | DeepGemmFP4Experts (2.1 tok/s) | 差异 |
+|------|-------------------|-------------------------------|------|
+| Permute | `sorted_token_ids` 由 vLLM 框架生成 | `deepgemm_moe_permute`（含 FP8 activation 量化） | CDG 多了 per-token FP8 quantize |
+| FC1 GEMM | `ops.moe_wna16_marlin_gemm` 1 次 fused C++ kernel | `m_grouped_fp8_fp4_gemm_nt_contiguous` Python 循环 6× dot_scaled | CDG: Python 循环 + 6 次 Triton launch |
+| Activation | `apply_moe_activation` | `_act_mul_quant`（SwiGLU + FP8 requantize） | CDG 多了 FP8 requantize |
+| FC2 GEMM | `ops.moe_wna16_marlin_gemm` 1 次 fused C++ kernel | `m_grouped_fp8_fp4_gemm_nt_contiguous` Python 循环 6× dot_scaled | 同上 |
+| Unpermute | Marlin kernel 内部完成 | `deepgemm_unpermute_and_reduce` | CDG 额外一步 |
+
+**速度差距来源**：
+1. **GEMM 调用方式**：Marlin 1 次 fused kernel 处理全部 expert，CDG Python 循环 6 次——这是主要差距
+2. **FP8 量化/反量化**：CDG 先 quantize activation 到 FP8（`deepgemm_moe_permute`），dot_scaled 内部又 cast 回来——做了无用功
+3. **额外步骤**：permute/unpermute 在 CDG 路径是独立 Python 调用，Marlin 融合在 kernel 里
+
+### 优化方向
+
+1. **写 fused CDG kernel**——把 permute + 6× dot_scaled + activation + unpermute 合成一个 Triton kernel，消灭 Python 循环
+2. **去掉不必要的 FP8 量化**——`deepgemm_moe_permute` 做了 per-token FP8 量化，但 dot_scaled 接受 BF16 input（内部再 cast）。直接传 BF16，省掉量化+反量化
+3. **直接修 Marlin**——仍然是终极方案，但 ldmatrix 行为差异的修复比想象复杂
+4. **等 Triton 修 SM120 native FP4 codegen**——`tl.dot_scaled` 从 bf16 emulation 升级到 native FP4 MMA
+
+### 当前可用镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 备注 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | Marlin MoE，英文乱码 |
+| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.2 tok/s | CDG shim 外挂 |
+| `vllm-node-jasl-fix:latest` | ✅ | ✅ | 2.1 tok/s | oracle 强制 DEEPGEMM + CDG |
+
+### 改动文件
+
+```
+Consumer-DeepGEMM/
+├── consumer_deep_gemm/
+│   ├── __init__.py         — CDG_PROFILE 默认关闭（去掉 cuda.synchronize 开销）
+│   └── triton_moe.py       — 新增 _e2m1_to_fp8, _fused_fp8_matmul_kernel,
+│                              _dot_scaled_matmul_kernel; 调度优化（argsort 替代 unique+nonzero）
+ └── tests/
+    ├── test_fp8_fused.py        — FP8 fused 正确性 + 速度
+    └── test_dot_scaled_fused.py — dot_scaled 正确性 + 速度
+```
+
+### 当前镜像
+
+### 去掉 FP8 量化/反量化无用功（2026-05-10 晚）
+
+**发现**：`DeepGemmFP4Experts.apply()` 的流程中存在 BF16→FP8→BF16 的无用转换：
+1. prepare 阶段：BF16 activation → FP8 量化（`per_token_group_quant_fp8`）
+2. CDG 内部：FP8 → dequant 回 BF16（`_dequant_fp8_block`）
+3. dot_scaled 内部：BF16 → cast 回 FP8
+
+**修复**：
+- `DeepGemmFP4Experts` 加 `expects_unquantized_inputs = True`——prepare 跳过 FP8 量化
+- apply 里 activation 保持 BF16 直传 CDG
+- `deepgemm_moe_permute` 需要 scale tensor——传 dummy `torch.ones` scale（permute 只做行排序，scale 值不影响排序结果）
+- SwiGLU 后不做 FP8 requant，保持 BF16
+
+**结果**：
+
+```
+英文 "What is quicksort?": 500 tokens / 121s = 4.1 tok/s ✅ 零垃圾
+```
+
+**速度演进**：
+
+| 版本 | tok/s | 相对首版 |
+|------|-------|---------|
+| Python fallback + CUTLASS | 0.79 | 1.0x |
+| Fused dequant+matmul（float32） | 1.87 | 2.4x |
+| CDG dot_scaled（外挂 shim） | 2.11 | 2.7x |
+| CDG oracle 强制（有 FP8 无用功） | 2.1 | 2.7x |
+| **CDG 去掉 FP8 无用功** | **4.1** | **5.2x** |
+| jasl Marlin（有乱码） | 14 | 17.7x |
+
+**去掉 FP8 round-trip 直接翻倍（2.1→4.1）。** 剩余差距（4.1 vs 14 = 3.4x）在 Python 循环 6 次 dot_scaled kernel launch + permute/unpermute 额外步骤。
+
+### 当前镜像
+
+| 镜像 | 中文 | 英文 | 速度 | 备注 |
+|------|------|------|------|------|
+| `vllm-node-jasl:latest` | ✅ | ❌ | 14 tok/s | Marlin MoE，英文乱码 |
+| `vllm-node-sm121-cdg:dot-scaled` | ✅ | ✅ | 2.2 tok/s | CDG shim 外挂 |
+| **`vllm-node-jasl-fix:latest`** | **✅** | **✅** | **4.1 tok/s** | **oracle 强制 DEEPGEMM + 去 FP8 无用功** |
+
+### Grouped kernel 尝试（失败）
+
+把 6 次 dot_scaled kernel launch 合成 1 次（grid 第三维 = expert 数量）。结果 3.6 tok/s——比循环版 4.1 更慢。原因：metadata tensor 创建开销 + max_M padding 导致空跑 thread block + Triton 3D grid 调度成本。回退到循环版。
+
+### 跳过 CDG 冗余 sort 尝试（失败）
+
+`deepgemm_moe_permute` 已按 expert 排序行，CDG 内部又做了一次 argsort。尝试直接在 apply 里从 expert_ids 做 segment detection 跳过 CDG 的 sort。结果全乱码——padding 行的偏移计算有 bug，`deepgemm_moe_permute` 的输出 layout（padding 行位置）需要更仔细的处理。回退。
+
+### Profiling（去掉 FP8 后，2026-05-10 晚）
+
+```
+BF16 input path (no FP8 round-trip):
+  sort+segment:       0.039 ms   2.7%
+  index_select:       0.009 ms   0.6%
+  6x_kernels:         1.174 ms  82.0%
+  1x_kernel:          0.151 ms  10.5%
+  index_copy:         0.011 ms   0.8%
+  full_bf16:          1.431 ms 100.0%
+  full_fp8_input:     1.618 ms  (old FP8 path)
+
+  Per token (×120): 172 ms = 5.82 tok/s (理论上限)
+  Kernel only:      141 ms
+  Overhead:         31 ms
+```
+
+如果 6 次合 1 次：1.431 - 1.174 + 0.151 = 0.408 ms → 理论 20.4 tok/s。但 grouped kernel 实测反而更慢。
+
+### 6× kernel 并发实验（2026-05-10 深夜）
+
+**发现：6 次 kernel 在单 stream 上是串行的**
+
+```
+test_grouped_vs_loop.py:
+  1x kernel (baseline):     GPU 0.163ms
+  6x loop (wrapper):        GPU 1.145ms  Wall 1.126ms  Py OH ≈ 0
+  6x loop (direct kernel):  GPU 1.117ms  Wall 1.124ms  Py OH ≈ 0
+
+  6x GPU / 1x GPU = 7.02x  (ideal=6.0, >6 = GPU串行确认)
+  Direct vs Wrapper overhead: 0.002ms  (Python包装层不是瓶颈)
+```
+
+**Python 开销几乎为零。** 瓶颈不在 Python 循环——是同一个 CUDA stream 上的 kernel 必须顺序执行。
+
+**多 stream 实验：独立 benchmark 有效，vLLM 端到端无提升**
+
+```
+test_multistream.py:
+  6x single stream:          GPU 1.111ms
+  6x multi stream (6 streams): GPU 0.866ms (0.78x, 并发有效)
+  1x kernel (ideal):          GPU 0.164ms
+
+  Per token (×120):
+    Single stream: 133ms = 7.5 tok/s
+    Multi stream:  104ms = 9.6 tok/s
+```
+
+独立 benchmark 提速 22%（1.111→0.866ms）。但接入 vLLM 端到端实测仍然 4.2 tok/s——和单 stream 一样。原因：vLLM 服务中 GPU 已被 attention/MLA 等其他 kernel 占满，多 stream 的 MoE kernel 争不到额外的 SM 资源。
+
+**结论：4.2 tok/s 是当前架构天花板。** 瓶颈在 `dot_scaled` 的 bf16 emulation（Triton issue #7550，不是 native FP4 MMA）+ 单 SM GPU（DGX Spark GB10 只有 20 个 SM）。
+
+### 下一步方向
+
+1. **等 Triton 修 SM120 native FP4 codegen**（issue #7550）——dot_scaled 从 bf16 emulation 升级到 native FP4 MMA，kernel 本身再快几倍
+2. **修 Marlin 的 sm_120 bug**——终极方案，直接 14 tok/s + 英文正确。根因已定位到 ldmatrix 行为差异，但修复需要理解 Marlin 完整的 smem swizzle pattern
+3. **升级 CUTLASS 到 v4.4.2**——christopherowen 的 64×128 tile patch 可用
+4. **写 C++ dispatch 循环**——把 6 次 Triton kernel launch 的 Python 循环搬到 C++ 里，消除 Python→Triton→CUDA 的调用链开销（虽然 profiling 显示 Python OH ≈ 0，但每次 Triton JIT dispatch 有固定开销）
+
+### 2026-05-11 追加：Grouped dot_scaled 实验降级
+
+继续检查 5-10 深夜的结论：把 6 次 expert dot_scaled kernel 合成 1 次 grouped launch，在独立 microbenchmark 有收益，但 vLLM 端到端更慢。
+
+本轮把已有 `_grouped_dot_scaled_kernel` 整理成独立实验路径，但**不作为默认路径启用**：
+
+- 新增 `triton_grouped_fused_fp4_matmul_nt`
+- 默认仍走 per-expert loop，保持 4.1 tok/s 的已验证路径
+- 设置 `CDG_GROUPED_DOT_SCALED=1` 才启用 grouped launch
+- 新增 `tests/test_grouped_dot_scaled.py`，但默认跳过；需要 `CDG_RUN_UNSAFE_GROUPED_TEST=1` 才跑
+- 清理 `tests/test_fused_e2e.py` 的硬编码路径和旧标签
+
+验证命令：
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment:/work \
+  -w /work/Consumer-DeepGEMM \
+  vllm-node-sm121-cdg:dot-scaled \
+  bash -lc 'PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_grouped_dot_scaled.py && PYTHONPATH=/work/Consumer-DeepGEMM python3 tests/test_fused_e2e.py'
+```
+
+默认安全测试结果：
+
+```text
+Grouped dot_scaled test is disabled by default; set CDG_RUN_UNSAFE_GROUPED_TEST=1 to run it.
+FC1 [M=384, K=7168, N=4096]:
+  Current default:      1.47 ms
+  Explicit baseline:    1.54 ms
+  Current/baseline:     1.05x
+
+FC2 [M=384, K=2048, N=7168]:
+  Current default:      0.76 ms
+  Explicit baseline:    0.84 ms
+  Current/baseline:     1.10x
+```
+
+额外发现：强行跑 grouped 路径时，短测试可出现 `max_diff=0`，但随后 CUDA 报 `illegal memory access`。这说明 grouped kernel 可能有越界写或 Triton `dot_scaled` + 3D grid 的隐藏问题。结论更新：**grouped launch 不是可用优化，只能作为失败实验/后续排查样本保留**。
+
+当前默认路径没有变化：per-expert loop + BF16 input + dot_scaled，仍是 `vllm-node-jasl-fix` 的 4.1 tok/s 正确路径。
+
+### 2026-05-11 追加：Marlin ldmatrix A 侧补偿实验
+
+目标：继续追 14 tok/s 正确路径，验证 Marlin 在 SM120/SM121 上的 `ldmatrix` 行为差异是否能通过寄存器重排修复。
+
+#### ldmatrix 行为探针
+
+`test_ldmatrix_address_probe.cu` 证明 GB10/SM121 的 `ldmatrix.x4` 取数模式和 SM80 语义不同：
+
+```text
+sm121 actual: src_addr_lane = frag * 8 + lane / 4, offset = 2 * (lane % 4)
+sm80 expected: src_addr_lane = frag * 8 + lane % 8, offset = 2 * (lane / 8)
+补偿映射: src_lane = (lane % 8) * 4 + lane / 8
+```
+
+`test_marlin_a_ldmatrix_swizzle.cu` 用 Marlin 的 `transform_a` / `a_sh_rd_trans` 复现 A 侧 swizzle，结果：
+
+```text
+raw vs sm80 oracle: 120 / 128 mismatch
+shfl vs sm80 oracle: 0 / 128 mismatch
+```
+
+结论：A operand 的 `ldmatrix.x4` 后做 `__shfl_sync` 补偿，在 Marlin A 侧共享内存 swizzle 下仍然数学正确。
+
+#### 构建坑
+
+最开始用宿主 `spark-vllm-docker/vllm-sm120/csrc` 直接 `glob csrc/moe/**/*.cu` 手工重编 `_moe_C` 是错的：会把 CMake 本来不放进 `_moe_C` 的 `mxfp8_moe/cutlass_mxfp8_*`、`dsv3_router_gemm_*` 等源文件一起编进去，符号和镜像原版不一致，模型加载会在 `w2.copy_ -> cudaMemcpyAsync` 阶段卡死。
+
+正确做法：用嵌套源码 `spark-vllm-docker/vllm-sm120/vllm-sm120/`，按 `CMakeLists.txt` 的 `VLLM_MOE_EXT_SRC` 精确源集手工编译：
+
+- `torch_bindings.cpp`
+- `moe_align_sum_kernels.cu`
+- `topk_softmax_kernels.cu`
+- `moe_wna16.cu`
+- `grouped_topk_kernels.cu`
+- `router_gemm.cu`
+- `topk_softplus_sqrt_kernels.cu`
+- `permute_unpermute_kernels/moe_permute_unpermute_kernel.cu`
+- `moe_permute_unpermute_op.cu`
+- generated `marlin_moe_wna16/sm80_kernel_*.cu`
+- generated `marlin_moe_wna16/sm89_kernel_*.cu`
+- `marlin_moe_wna16/ops.cu`
+
+这版 `_moe_C.abi3.so` 可正常启动，权重加载时间同原版同量级。
+
+#### 实机结果
+
+补丁：只在 `ldsm<count == 4>` 后对 A fragment 做 lane shuffle：
+
+```cpp
+int lane = threadIdx.x & 31;
+int src_lane = (lane % 8) * 4 + lane / 8;
+a[0] = __shfl_sync(0xffffffff, a[0], src_lane);
+a[1] = __shfl_sync(0xffffffff, a[1], src_lane);
+a[2] = __shfl_sync(0xffffffff, a[2], src_lane);
+a[3] = __shfl_sync(0xffffffff, a[3], src_lane);
+```
+
+英文测试仍然垃圾：
+
+```text
+Prompt: What is quicksort? Explain with code.
+300 tokens / 36.26s = 8.27 tok/s
+Output: "## (îîî plutôt( plutôt(... 而非而非..."
+```
+
+结论：**A 侧 ldmatrix 补偿是必要局部修正，但不是 Marlin 英文乱码的完整根因。** 下一步应转向 B/scale/repack：
+
+1. 验证 B 侧 `ldmatrix.trans.x2` 或等价 tensor-core B fragment 布局在 SM121 上是否也变了。
+2. 复核 MXFP4 `gptq_marlin_repack`、`dequant<FE2M1f>`、`b_quant_0/b_quant_1` 的组合顺序。
+3. 如果 B 侧存在同类 lane-group 重排，补偿点不在 shared load，而可能在 `frag_b_quant -> dequant -> FragB` 的寄存器顺序。
+
+#### B fragment / FP4 nibble 顺序确认
+
+`test_mma_b_fragment_layout.cu` 先确认 B operand 不能按连续 lane 值手搓；`ldmatrix.x2.trans` 给 MMA 的 B fragment 是 K/N 交错布局。随后新增 `test_b_pack_perm_search.cu`，用 identity A + BF16 MMA 穷举 lane-local B 候选顺序，得到硬结果：
+
+```text
+best diff 0 / 128
+required first B operand nibble order: {0,1,4,5}
+```
+
+而当前 Marlin FP4 repack 的 word 内顺序是：
+
+```text
+old packed word: {0,2,4,6,1,3,5,7}
+dequant_data reads positions {2,3,6,7}
+current FE2M1 path feeds first MMA operand: {0,2,1,3}
+```
+
+因此 A 侧补偿后仍乱码是合理的：B 侧第一组 MMA operand 被喂错。补丁已加到 `spark-vllm-docker/vllm-sm120/vllm-sm120/csrc/moe/marlin_moe_wna16/marlin_template.h` 的 FE2M1 分支，只对 `__CUDA_ARCH__ >= 1200` 生效，在 dequant 前用寄存器 bit 操作把旧 word 重组为：
+
+```text
+frag_b0 sees {0,1,4,5}
+frag_b1 sees {2,3,6,7}
+```
+
+小型 MoE correctness probe `test_moe_marlin_fp4_probe.py` 已通过：
+
+```text
+max_abs 4.3392181396484375e-05
+mean_abs 5.1775491556327324e-06
+torch.testing.assert_close(atol=4e-2, rtol=0) passed
+```
+
+这说明寄存器级 B 重排方向正确，至少在随机 MXFP4 MoE 小矩阵上，Marlin 输出已经贴近 torch 参考。
+
+#### 当前阻塞
+
+重编 exact-source `_moe_C.abi3.so` 后必须同时同步到两台机器；否则 head/worker 挂载本地路径会拿到不同 so。已确认并同步：
+
+```text
+head/worker sha256: 4f3624551e7cdf1deb229bf3c651afe1006d8951f02f21763148defc95af8a7b
+```
+
+但双机整模型加载仍卡在 safetensors `30/46` 附近，GPU util 0%，head `RayWorkerWrapper.execute_method` 单核高 CPU。这个卡点发生在生成前，和小型 MoE kernel correctness 分开看。下一步不要继续盲等整模型；应做两件事：
+
+1. 用原镜像 `_moe_C` 的构建方式复刻 96MB mixed-cubin so，只把 A/B 两处补丁打进去，避免 exact-source so 和镜像 ABI/符号集有细微差异。
+2. 或直接在镜像内原地替换源码后按镜像自己的构建脚本重编 `_moe_C`，再测整模型英文输出。
+
+### 2026-05-11 继续验证：fatbin 布局对齐与 `jasl-fix` 后端强制分支
+
+#### 修正 exact-source 重链脚本
+
+上一版 `rebuild_exact_moe_c.sh` 的问题不是 kernel 数值，而是链接顺序：脚本用
+`sorted(glob(...*.o))` 重链，导致 `ops.o` 提前，fatbin cubin 编号变成：
+
+```text
+2 sm120 + 14 sm80 + 12 sm120
+```
+
+这和镜像自带 `_moe_C.abi3.so` 的布局不同。已修正为按 source list 顺序重链，并把
+`marlin_moe_wna16/ops.cu` 也重编为 `sm_80`。新产物：
+
+```text
+sha256: 5d53a2467850dd230c58a73575aa4fb0da570049e6aa574f6e6ab4172016f462
+cubin layout: 8 sm120 + 14 sm80 + 5 sm120 + 1 sm80
+```
+
+这个布局已经和 `vllm-node-jasl` / `vllm-node-jasl-fix` 自带 so 对齐。real checkpoint probe 通过：
+
+```text
+python3 test_real_mxfp4_marlin_probe.py 8 2 6
+max_abs 0.0001220703125
+mean_abs 1.0350617e-05
+```
+
+#### `jasl-fix + 新 _moe_C + 强制 DeepGEMM` 结果
+
+只挂载新 `_moe_C`，使用 `vllm-node-jasl-fix --moe-backend marlin` 可完整加载并输出正常英文，但日志显示：
+
+```text
+mxfp4.py: DGX Spark: forcing DEEPGEMM_MXFP4 backend (Marlin has bugs on sm_12x)
+```
+
+也就是说 `jasl-fix` 的 Python oracle 在 `select_mxfp4_moe_backend()` 开头硬 return DeepGEMM，`--moe-backend marlin` 没真正生效。实测 prompt：
+
+```text
+220 completion tokens / 61.58s = 3.57 tok/s
+输出正常英文
+```
+
+这不是提速路径，只是正确性基线。
+
+#### `jasl-fix + 新 _moe_C + 正常 oracle` 结果
+
+把本地正常版
+`vllm/model_executor/layers/fused_moe/oracle/mxfp4.py`
+也挂进 `jasl-fix` 后，强制 DeepGEMM 分支消失，加载再次卡在 30/46。`py-spy` 栈：
+
+```text
+cuMemcpyHtoDAsync_v2
+torch copy_
+_load_w13 (vllm/model_executor/layers/fused_moe/layer.py:1003)
+weight_loader
+load_weights
+```
+
+worker 已 idle，head 单 worker 高 CPU。结论：Marlin kernel / repack 在 isolated probe 上正确，但完整模型 Marlin 权重加载路径仍有大模型级别卡死问题。当前不要再调 `ldmatrix`，下一步应定位 `_load_w13/_load_w2` 在 Marlin experts 下的实际目标张量 shape、stride、device allocation 和内存余量，找出为什么完整 256 experts 加载卡在 HtoD。
+
+#### Host 重启后复测
+
+Zero 重启 host 后复跑同一配置：
+
+```text
+vllm-node-jasl-fix
++ 新 _moe_C
++ 正常 oracle/mxfp4.py
++ --moe-backend marlin
+```
+
+仍卡在 safetensors `30/46`。这次可排除“宿主脏状态偶发卡死”。栈保持一致：
+
+```text
+head rank:
+cuMemcpyHtoDAsync_v2
+torch copy_
+_load_w13 (vllm/model_executor/layers/fused_moe/layer.py:1003)
+
+worker rank:
+load_model -> current_memory_usage
+```
+
+所以当前硬结论更新为：**真实 Marlin 路径不是生成期算错，而是完整模型加载期在 rank0 的 `w13` HtoD 拷贝卡住。** `ldmatrix` 仍是已修复的 kernel 内部 bug，但已经不是当前阻塞点。
+## 2026-05-11 Marlin full-model retry after head+slave reboot
+
+- Retried true Marlin path after rebooting both head and slave. It still hangs at 30/46 with `max_model_len=131072`, so the previous hang is not dirty host/slave runtime state.
+- Added `VLLM_MOE_LOAD_TRACE` probes in `fused_moe/layer.py`. The 131k load hang is not tied to one fixed tensor:
+  - head/rank0 stopped in `expert_data.copy_()` around `model.layers.29.ffn.experts`, last visible tensor `w3 expert=217`, source/target 2 MiB.
+  - slave/rank1 stopped in `expert_data.copy_()` around `model.layers.19.ffn.experts`, last visible tensor `w2 expert=8`, source/target 2 MiB.
+  - This points to loading-time CUDA allocator/memory pressure, not safetensors corruption or a single bad expert.
+- Re-ran true Marlin with `max_model_len=4096`; full model loads successfully. Model memory is about 73.85 GiB per GB10 and vLLM reports ~27-29 GiB available for KV after load. Therefore the 131k failure is a memory/slack issue specific to true Marlin under the `jasl-fix` image.
+- However, 4k true Marlin generation is still garbage, even with the fixed `_moe_C`:
+  - Example prompt returned mixed fragments such as `GP,_然後...`, not coherent English.
+  - Throughput for the bad output was about 4.26 tok/s on a short prompt.
+- Added `test_real_mxfp4_marlin_tp_probe.py` to test real checkpoint MXFP4 weights with vLLM-style TP partitioning:
+  - `w1/w3` split along intermediate dimension.
+  - `w2` split along intermediate input dimension.
+  - rank0 and rank1 Marlin outputs are summed and compared to full BF16 dequant reference.
+  - Result: PASS, max_abs `0.000244140625`, mean_abs `2.3e-05` for `experts=8 m=2 topk=6`.
+- Patched `fused_marlin_moe.py` so the normal `MarlinExperts.apply()` path passes `clamp_limit=self.gemm1_clamp_limit`, matching the LoRA path. DeepSeek V4 has `swiglu_limit=10.0`, so this was a real integration bug. The patch loaded correctly, but full-model output remained garbage.
+- Current diagnosis:
+  - ldmatrix/MMA/nibble reorder: isolated and TP probes pass.
+  - weight loading layout: real checkpoint + TP probes pass.
+  - full-model Marlin: still wrong at the FusedMoE runner/module integration layer.
+  - Next useful test is a runner-level single-layer DeepGEMM-vs-Marlin comparison using actual `FusedMoE` routing/topk/prepare/finalize, not another raw GEMM probe.
+
+### 2026-05-11 Follow-up after rebooting both nodes
+
+- Retested 4k true Marlin after both head and slave were rebooted. Full model loads successfully, but generation is still corrupted:
+
+```text
+96 completion tokens / 21.84s = 4.40 tok/s
+output: GPUs�名思义�后续GP后续...
+```
+
+- `--enforce-eager` is confirmed in the logs, so CUDA graph capture is not the corruption source.
+- A/B tested `VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`; output remains corrupted. Shared-expert aux stream overlap is not the source.
+- Added `test_real_mxfp4_marlin_expert_map_probe.py` to cover the real TP expert-map path that earlier probes missed:
+  - local rank-1 style experts `128..255`
+  - `expert_map` maps global expert id to local id
+  - mixed valid/invalid top-k ids to simulate real TP routing before all-reduce
+  - layer 0 and layer 41 both pass against BF16 dequant reference with max_abs around `1e-4..2e-4`
+- Tried to expose `batched_marlin` through CLI for an upper-layer A/B, but this vLLM build does not accept it as a public `--moe-backend` choice.
+
+Current narrowed conclusion: true Marlin's raw kernel, TP sharding, expert-map masking, and mixed-rank routing all pass. The remaining likely fault is a full runner/model interaction that is not reproduced by standalone `fused_marlin_moe()` probes. Next best test is to instantiate one real `DeepseekV4MoE/FusedMoE` layer in-process and compare Marlin vs DeepGEMM at the layer boundary with the same hidden states and router logits.
