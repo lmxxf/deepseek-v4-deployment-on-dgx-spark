@@ -70,19 +70,17 @@ def _act_dump_wrap(cls, method_name):
                     if n < int(_os.environ.get("VLLM_MXFP4_DUMP_MAX", "8")):
                         _dump_counts[key] = n + 1
                         _os.makedirs(d, exist_ok=True)
+                        def _snap(v):
+                            if isinstance(v, _t.Tensor):
+                                return v.detach().to("cpu", copy=True)
+                            return v
                         payload = {
                             "layer": name,
                             "method": method_name,
                             "x": x.detach().to("cpu", copy=True),
-                            "args": [
-                                a.detach().to("cpu", copy=True)
-                                if isinstance(a, _t.Tensor)
-                                else a
-                                for a in args
-                            ],
-                            "out": out.detach().to("cpu", copy=True)
-                            if isinstance(out, _t.Tensor)
-                            else None,
+                            "args": [_snap(a) for a in args],
+                            "kwargs": {k: _snap(v) for k, v in kwargs.items()},
+                            "out": _snap(out),
                         }
                         _t.save(payload, f"{d}/{name}.{method_name}.{n}.pt")
             except Exception as e:  # noqa: BLE001

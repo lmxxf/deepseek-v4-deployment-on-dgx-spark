@@ -635,3 +635,48 @@ CDG 把中间激活量化 FP8（~3%/元素噪声）跑 43 层干净；Marlin bf1
 
 - 2026-06-12 白天：两台 Spark 同时僵死（早上还好，晚上回家全挂，拔电重启）。当天只在 host 本地干活（docker build、单 GPU 探针、磁盘扫描），slave 未碰，抓取脚本未跑过，`debug_acts/` 为空。原因不明——嫌疑：共用电源 / GB10 驱动 / RoCE 链路平台级问题。若 serve 时复现双挂，按平台级 bug 另查。
 
+### 2026-06-13 进展：dump 抓到
+
+- 双机服务起来正常，复现英文乱码（"Write a quicksort..." → "The function should take... Provide a step-by-step..." 把 prompt 续写当自言自语）。
+- 抓到 344 个 dump 文件（43 层 × 8 帧），2.9 GiB，落在 `debug_acts/`。
+- 首次抓取后发现 hook bug：`args=[]`，topk 信息丢失（vLLM 实际用 kwargs 调 `apply`）。已修 `scripts/build-act-dump-image.sh`，新 hook 同时存 `*args` 和 `**kwargs`，重抓后字段齐全。
+- dump 字段确认（layer 0/21/42 frame 0，TP=2 rank0 切片，hidden 4096，intermediate 1024）：
+  - `x`: `(2048, 4096) bf16` —— MoE 输入。
+  - `kwargs.topk_weights`: `(2048, 6) fp32`，`absmax≈1.0~1.5`。
+  - `kwargs.topk_ids`: `(2048, 6) int32`，rank0 是 256 中的一片 expert id（min/max 落在 [23, 254] 范围）。
+  - `kwargs.shared_experts_input`: 与 `x` 完全相同（同一 tensor，回放时无需单独管）。
+  - `out`: `(2048, 4096) bf16`。
+
+### 意外发现：layer 42 输出 absmax 爆炸
+
+| 层 | `x` absmax | `out` absmax |
+|---:|---:|---:|
+| 0 | 0.90 | 22.6 |
+| 21 | 1.41 | 31.8 |
+| 42 | **5.41** | **9344** |
+
+- `x` 沿层数单调上涨（0.9 → 1.4 → 5.4），MoE 输入越来越极端。
+- layer 42 输出 `absmax=9344`，比正常层（22~32）大 ~300 倍。
+- 注意当前是混合后端配置（前 42 层 Marlin + layer 42 fallback 到 CDG），所以 layer 42 这个极端 out 是 **CDG 跑出来的**，但输入 x 已经被前 42 层 Marlin "污染"。
+- 这是新信号：sm_121 上的 Marlin 偏差不是均匀小漂移，而是把某些通道推到 5σ 之外，被 CDG 在最后一层兜回正常 logits 范围才让最终输出能用。
+- 旁证 §6 的混合方案为何"恰好 work"：不是 CDG 计算更准，是 CDG 没有 Marlin 在 sm_121 上的系统性偏差，能消化掉前序累积的极端 x。
+
+### 下一步：双配置 bisect dump 对比（推迟到下次）
+
+不急着写完整 Marlin-vs-CDG 回放（要重新加载 MXFP4 权重 + 调 fused_marlin_moe + 调 CDG kernel，工作量大）。先做更快的实验：
+
+- 启动 `VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42` 抓一次（混合，正常输出）。
+- 启动 `VLLM_MXFP4_MARLIN_LAYER_RANGE=0:43` 抓一次（全 Marlin，乱码）。
+- 同一 prompt，逐层对比两次 dump 的 `x` 和 `out`：
+  - 如果两次的 layer N 输入 `x` 已经分叉 → 污染来自 layer N-1 的 Marlin。
+  - 如果 `x` 一致但 `out` 分叉 → layer N 的 Marlin 自己在真实激活上偏。
+- 沿层向下追到第一个分叉点 → 真凶层。
+- 在真凶层上才需要写完整 Marlin/CDG kernel 回放对比。
+
+### 文件清单
+
+- `scripts/build-act-dump-image.sh` —— hook 装载脚本（已修 kwargs）。
+- `test/run_act_dump.sh` —— 三段式：`sync | serve | probe`。
+- `test/replay_marlin_vs_cdg.py` —— 回放骨架（目前只有 dump 结构 inspect，核心 kernel 对比待写）。
+- `debug_acts/` —— 抓到的 dump（344 文件，2.9 GiB，未进 git）。
+
