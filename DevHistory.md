@@ -710,3 +710,65 @@ CDG 把中间激活量化 FP8（~3%/元素噪声）跑 43 层干净；Marlin bf1
   - `test/run_act_dump.sh serve mixed`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42`，输出到 `debug_acts_mixed/`。
   - `test/run_act_dump.sh serve all-marlin`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:43`，输出到 `debug_acts_all_marlin/`。
   - `test/replay_marlin_vs_cdg.py --compare-left debug_acts_mixed --compare-right debug_acts_all_marlin --frame 0` 可直接按层比较 `x/out` 分叉。
+
+### 2026-06-14 结论：真分叉在 layer42，根因是最终层 W4A8/W4A16 语义漂移
+
+双配置重抓：
+
+- mixed：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42`，0-41 Marlin，42 CDG，输出可用。
+- all-marlin：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:43`，0-42 全 Marlin，英文乱码。
+- prompt 同一条：`Write a quicksort function in Python and explain how it works.`
+- dump 已跳过 warmup，frame 0 是真实 prefill：`call_index=3`，`x.shape=(14,4096)`，14 行互不相同。
+
+逐层对比 mixed vs all-marlin：
+
+- layer 0-41：`x_max_diff=0`，`out_max_diff=0`，两次完全一致。
+- layer 42：`x/topk_ids/topk_weights` 完全一致，只是 backend 不同。
+- layer 42 输出差异：
+  - `out_max_diff=0.16210938`
+  - `out_p999_diff=0.109375`
+  - `out_mean_diff≈0.02455`
+  - `out_cos≈0.99939`
+
+因此：
+
+- 旧猜测“前 42 层 Marlin 累积污染，最后 CDG 兜底”撤回。
+- 真实第一分叉点就是最终 MoE 层 layer42。
+- 36/37 的大尖峰不是 mixed/all-marlin 差异来源，两边相同。
+
+离线复现：
+
+- 新脚本：`test/replay_layer42_ep_ref.py`。
+- 关键语义不是 EP 128 experts，也不是 full FFN，而是：
+  - `--tensor-parallel-size 2`
+  - 每个 rank 都有 256 experts
+  - 每个 rank 只加载 intermediate 半片
+  - rank0 输出 shape 仍是 `(14,4096)`，等待 TP all-reduce
+- 用 safetensors 载入 layer42，按 TP rank0 切 `w1/w3` 行和 `w2` 列，再喂给 `fused_marlin_moe`：
+  - `marlin rank0 dump vs marlin_replay_tp0: max=0, mean=0`
+- 说明 all-marlin dump 没问题，Marlin replay 也没问题，坐标已经对齐。
+
+高精度公式 reference（解量化 FP4 + bf16 输入 + clamp）对 TP0：
+
+- `marlin rank0 dump vs ref_tp0: max=0.03125, mean=0.00259, cos=0.999990`
+- `mixed/CDG rank0 dump vs ref_tp0: max=0.1660, mean=0.02441, cos=0.999395`
+
+这个结果很关键：Marlin 更接近 W4A16 的“高精度公式”；CDG 更远。但 CDG 输出可用，Marlin 乱码。
+
+根因判断：
+
+- DeepGEMM FP4 backend 不是 W4A16。代码里明确写了：
+  - `DeepGemmFP4Experts` 使用 `FP8 activations and MXFP4 weights`
+  - Oracle `make_mxfp4_moe_quant_config()` 对 `DEEPGEMM_MXFP4` 生成 `_a1/_a2 = FP8 dynamic block 128`
+- Marlin 当前路径是 W4A16（bf16 activation × MXFP4 weight），不是 DeepGEMM 的 W4A8 语义。
+- 对 0-41 层，这个语义漂移没有马上破坏 greedy path。
+- 对最终 layer42，0.16 级别的输出漂移发生在 logits 前最后一次 residual 更新，足够把下一 token 翻到坏吸引子，于是 all-marlin 英文乱码。
+
+工程结论：
+
+- 当前最小正确规避仍是：0-41 Marlin，42 CDG。
+- 若要全 Marlin 正确，不能只“修数值精度”；需要让 Marlin 复现 DeepGEMM FP4 的 W4A8 activation quantization 语义：
+  - FC1 输入按 FP8 per-token-group block=128 量化；
+  - SwiGLU 后 FC2 输入也按 FP8 per-token-group block=128 量化；
+  - 或者在 layer42 保留 CDG fallback。
+- 这不是 layer42 权重损坏，也不是 warmup dump 误判，也不是 EP expert_map 漏传。
