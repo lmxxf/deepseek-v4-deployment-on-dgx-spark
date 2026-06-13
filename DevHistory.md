@@ -706,6 +706,7 @@ CDG 把中间激活量化 FP8（~3%/元素噪声）跑 43 层干净；Marlin bf1
 - 现有 dump 只能说明：真实 prompt prefill 在中后层（尤其 36/37）有尖峰；decode 本身干净。
 - 下一步仍是双配置对比，但必须跳过 warmup/profile：
   - `scripts/build-act-dump-image.sh` 增加 `VLLM_MXFP4_DUMP_SKIP`，默认用 3 跳过前三次每层调用，并记录原始 `call_index`。
+  - dump payload 同时记录 `moe_kernel_type` / `fused_experts_type`，用于确认实际运行的是 `MarlinExperts` 还是 `DeepGemmFP4Experts`。
   - `test/run_act_dump.sh serve mixed`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42`，输出到 `debug_acts_mixed/`。
   - `test/run_act_dump.sh serve all-marlin`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:43`，输出到 `debug_acts_all_marlin/`。
   - `test/replay_marlin_vs_cdg.py --compare-left debug_acts_mixed --compare-right debug_acts_all_marlin --frame 0` 可直接按层比较 `x/out` 分叉。

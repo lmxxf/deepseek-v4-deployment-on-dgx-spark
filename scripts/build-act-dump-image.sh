@@ -83,6 +83,8 @@ def _act_dump_wrap(cls, method_name):
                             "layer": name,
                             "method": method_name,
                             "call_index": n,
+                            "moe_kernel_type": type(getattr(self, "moe_kernel", None)).__name__,
+                            "fused_experts_type": type(getattr(getattr(self, "moe_kernel", None), "fused_experts", None)).__name__,
                             "x": x.detach().to("cpu", copy=True),
                             "args": [_snap(a) for a in args],
                             "kwargs": {k: _snap(v) for k, v in kwargs.items()},

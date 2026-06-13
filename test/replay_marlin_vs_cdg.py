@@ -64,6 +64,9 @@ def summarize(name, d):
             print(f"    {k}: {type(v).__name__} = {v}")
     if "call_index" in d:
         print(f"  call_index: {d['call_index']}")
+    for k in ("moe_kernel_type", "fused_experts_type"):
+        if k in d:
+            print(f"  {k}: {d[k]}")
     x = d["x"]
     if x.ndim == 2 and x.shape[0] > 1:
         same_first_last = torch.equal(x[0], x[-1])
