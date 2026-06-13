@@ -4,6 +4,8 @@ set -euo pipefail
 # Build an activation-dump debug image from the deployed hybrid image.
 # Adds an env-gated hook to Mxfp4MoEMethod.apply that saves each MoE layer's
 # input activations / routing / output to VLLM_MXFP4_DUMP_DIR (rank0 only).
+# VLLM_MXFP4_DUMP_SKIP skips the first N calls per layer, which are usually
+# vLLM profiling/warmup dummy batches rather than user prompts.
 # Used to capture REAL activations for local Marlin-vs-reference replay.
 #
 # Usage:
@@ -67,8 +69,11 @@ def _act_dump_wrap(cls, method_name):
                     name = getattr(layer, "layer_name", "unknown")
                     key = (method_name, name)
                     n = _dump_counts.get(key, 0)
-                    if n < int(_os.environ.get("VLLM_MXFP4_DUMP_MAX", "8")):
-                        _dump_counts[key] = n + 1
+                    _dump_counts[key] = n + 1
+                    skip = int(_os.environ.get("VLLM_MXFP4_DUMP_SKIP", "0"))
+                    max_dump = int(_os.environ.get("VLLM_MXFP4_DUMP_MAX", "8"))
+                    if n >= skip and n < skip + max_dump:
+                        dump_idx = n - skip
                         _os.makedirs(d, exist_ok=True)
                         def _snap(v):
                             if isinstance(v, _t.Tensor):
@@ -77,12 +82,13 @@ def _act_dump_wrap(cls, method_name):
                         payload = {
                             "layer": name,
                             "method": method_name,
+                            "call_index": n,
                             "x": x.detach().to("cpu", copy=True),
                             "args": [_snap(a) for a in args],
                             "kwargs": {k: _snap(v) for k, v in kwargs.items()},
                             "out": _snap(out),
                         }
-                        _t.save(payload, f"{d}/{name}.{method_name}.{n}.pt")
+                        _t.save(payload, f"{d}/{name}.{method_name}.{dump_idx}.pt")
             except Exception as e:  # noqa: BLE001
                 print("act dump hook error:", e)
         return out

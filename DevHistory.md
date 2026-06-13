@@ -680,3 +680,32 @@ CDG 把中间激活量化 FP8（~3%/元素噪声）跑 43 层干净；Marlin bf1
 - `test/replay_marlin_vs_cdg.py` —— 回放骨架（目前只有 dump 结构 inspect，核心 kernel 对比待写）。
 - `debug_acts/` —— 抓到的 dump（344 文件，2.9 GiB，未进 git）。
 
+### 2026-06-14 更正：layer 42 爆炸是 warmup/profile 假信号
+
+复查 `debug_acts/` 后发现：
+
+- frame 0/1 是 `(2048,4096)`，frame 2 是 `(256,4096)`，且 `x/topk_ids/topk_weights` 所有行完全相同（`torch.unique(x[:64], dim=0)=1`）。
+- 这些不是英文 prompt 的真实激活，而是 vLLM profiling/warmup/dummy batch。
+- 因此上面 “layer 42 输出 absmax=9344” 不能作为模型真实污染证据，属于 dump 解释错误。
+
+真实请求从 frame 3 开始：
+
+- frame 3 是 `(14,4096)`，14 行互不相同，对应 prompt prefill。
+- frame 4-7 是 `(1,4096)` decode。
+- 真实 frame 3 中 layer 42 正常：`x_absmax≈2.55, out_absmax≈8.8`。
+- 真正可疑的是 prompt prefill 的 layer 32/36/37/41：
+  - layer 32：`out_absmax≈328`
+  - layer 36：`out_absmax≈1864`
+  - layer 37：`out_absmax≈1760`
+  - layer 41：`out_absmax≈528`
+- decode frame 4-7 没有百级以上爆炸。
+
+更新判断：
+
+- “最后一层 CDG 兜住 layer42 爆炸”这条解释撤回。
+- 现有 dump 只能说明：真实 prompt prefill 在中后层（尤其 36/37）有尖峰；decode 本身干净。
+- 下一步仍是双配置对比，但必须跳过 warmup/profile：
+  - `scripts/build-act-dump-image.sh` 增加 `VLLM_MXFP4_DUMP_SKIP`，默认用 3 跳过前三次每层调用，并记录原始 `call_index`。
+  - `test/run_act_dump.sh serve mixed`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:42`，输出到 `debug_acts_mixed/`。
+  - `test/run_act_dump.sh serve all-marlin`：`VLLM_MXFP4_MARLIN_LAYER_RANGE=0:43`，输出到 `debug_acts_all_marlin/`。
+  - `test/replay_marlin_vs_cdg.py --compare-left debug_acts_mixed --compare-right debug_acts_all_marlin --frame 0` 可直接按层比较 `x/out` 分叉。
