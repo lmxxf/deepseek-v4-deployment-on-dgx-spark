@@ -11,3 +11,5 @@ DeepGEMM/
 test/vllm-40082/
 .antigravitycli
 debug_acts
+debug_acts_all_marlin
+debug_acts_mixed
