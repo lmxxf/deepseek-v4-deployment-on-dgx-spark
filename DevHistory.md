@@ -600,3 +600,38 @@ PP 在大模型训练中常见，但在线单请求 decode 容易被流水线气
 - 是否能把 Consumer-DeepGEMM 的调度从 Python 循环进一步融合。
 - 更系统地比较 TP/PP 在 Mac/USB/普通网络环境下的收益边界。
 
+## 18. Marlin 全 43 层乱码根因排查（进行中，2026-06-12 起）
+
+针对 §17 第三条的根因排查。
+
+### 已证伪（全部本地单 GPU 实验）
+
+1. **Marlin kernel 数值脏** ❌ — 新探针 `test/test_marlin_err_structure.py`：fp32 金标准 + 幅度扫描（×0.1/×1/×4/outlier±30）+ m∈{1,2,16,256}，Marlin 误差 ≡ bf16 舍入（excess_ratio≈1.0，bad_cols=0/4096）。jasl 的两个 sm_120 补偿（`marlin_template.h` L99 ldsm lane shuffle、L1374 B nibble 重排）是干净的。
+2. **fp16 global reduce** ❌ — MoE 路径硬编码 `use_fp32_reduce=True, use_atomic_add=False`。
+3. **swiglu clamp 语义** ❌ — 官方 `deepseek-v4-flash/inference/model.py` Expert.forward 确认 clamp（gate max=10，up ±10）是模型本尊语义，Marlin 的 `swiglu_limit_func`（`fused_moe/utils.py:391`，仅 Marlin 路径调用）忠实实现。CDG 路径反而**不 clamp**（默认 FLOAT32 scale fmt → colmajor 分支无 clamp）却输出干净 → clamp 很少触发，纯保险丝。
+4. **W4A8-FP8 激活路径** ❌ — `VLLM_MARLIN_INPUT_DTYPE` 未设，部署走 bf16 激活（W4A16），探针测的就是部署 kernel。
+5. **E8M0 scale 溢出** ❌ — `test/scan_scales.py` 扫全 43 层 33024 个 scale 张量：全部 118~126（2^-9..2^-1），无悬崖。
+
+### 核心推理
+
+CDG 把中间激活量化 FP8（~3%/元素噪声）跑 43 层干净；Marlin bf16 激活（~0.2%）却乱码。
+**→ §5 的"43 层数值误差累积"解释站不住：若是噪声累积，FP8 应先乱。真凶是系统性偏差，且只在真实激活/真实路由下发火（随机输入探针全绿）。**
+旁证：乱码挑语言（中文好英文乱）= 偏差打在特定 expert/通道上，随机噪声不挑语言。
+
+### 剩余嫌疑（需真实激活区分）
+
+- 真实激活的 outlier 方向 × 权重列对齐（随机探针摸不到）。
+- 真实 top-6 非均匀路由 / 256 expert 满配（探针只测了 8 expert 均匀路由）。
+- TP=2 交互（探针单 GPU；但 bisect 时 TP=2 下 42 层 Marlin 也干净，嫌疑低）。
+- 官方参考用 fp32 算 silu（"for stability"），Marlin 路径在 bf16 算 — 单独不致命（FP8 act 都没事），可能与上面叠加。
+
+### 下一步：抓真实激活回放
+
+- 镜像 `vllm-deepseek-v4-act-dump:latest` 已构建+语法验证。hook = 镜像内 mxfp4.py 末尾 monkeypatch `Mxfp4MoEMethod.apply/apply_monolithic`，env `VLLM_MXFP4_DUMP_DIR` 控制，rank0 only，每层 max 8 份，存 x/topk/out。构建脚本 `scripts/build-act-dump-image.sh`。
+- 抓取脚本 `test/run_act_dump.sh`：`sync`（拷镜像到 slave）→ `serve`（混合后端起服务）→ `probe`（英文 prompt，dump 落 `debug_acts/`）。
+- 抓到后本地回放：逐层 真实激活 → Marlin(带clamp) vs CDG 语义 vs fp32 官方 ref，找系统性分歧的层/expert/通道。回放脚本待写（等 dump 数据定 shape）。
+
+### 事故记录
+
+- 2026-06-12 白天：两台 Spark 同时僵死（早上还好，晚上回家全挂，拔电重启）。当天只在 host 本地干活（docker build、单 GPU 探针、磁盘扫描），slave 未碰，抓取脚本未跑过，`debug_acts/` 为空。原因不明——嫌疑：共用电源 / GB10 驱动 / RoCE 链路平台级问题。若 serve 时复现双挂，按平台级 bug 另查。
+
