@@ -156,7 +156,7 @@ TAG=production-ready SPEC=off ./spark-launch-0731.sh 1   # worker
 TAG=production-ready SPEC=off ./spark-launch-0731.sh 0   # head
 ```
 
-停止服务：两台各执行 `docker rm -f vllm_unholy`。
+停止服务：两台各执行 `docker stop vllm_unholy`（保留容器，之后 `docker start vllm_unholy` 可原配置复活，模型加载时间照旧）。想彻底删掉用 `docker rm -f vllm_unholy`——不过重跑启动脚本时它自己会先清掉旧容器，一般不用手动删。
 
 ---
 
