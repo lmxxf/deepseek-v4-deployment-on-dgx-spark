@@ -17,10 +17,10 @@ MODEL_DIR="${MODEL_DIR:-$HOME/work/models/DeepSeek-V4-Flash-0731}" # 权重目�
 # =============================================================
 
 # 可选开关：
-#   TAG=production-hybrid-1.6（默认，支持 DSpark 投机）| production-ready（旧稳定版，投机必须 SPEC=off）
-#   SPEC=dspark（默认）| mtp | off
-TAG="${TAG:-production-hybrid-1.6}"
-SPEC="${SPEC:-dspark}"
+#   默认 = 稳定配置：TAG=production-ready + SPEC=off（24.5 tok/s，长对话稳定）
+#   想试 51 tok/s：TAG=production-hybrid-1.6 SPEC=dspark ——⚠️ benchmark 稳、真实长对话会 CUDA 非法访问崩掉（文档坑 6）
+TAG="${TAG:-production-ready}"
+SPEC="${SPEC:-off}"
 
 HEADLESS_FLAG=""
 [ "$NODE_RANK" = "1" ] && HEADLESS_FLAG="--headless"

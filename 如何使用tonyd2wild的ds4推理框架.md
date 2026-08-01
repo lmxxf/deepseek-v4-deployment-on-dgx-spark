@@ -4,12 +4,14 @@
 
 | 指标 | 实测值 |
 |---|---:|
-| decode（DSpark 投机开启） | **51 tok/s** |
-| decode（纯自回归，无投机） | 24.5 tok/s |
+| decode（稳定配置，纯自回归） | **24.5 tok/s** |
+| decode（DSpark 投机，见下方警告） | 51 tok/s |
 | prefill（8.9K token，热） | 1630 tok/s |
 | prefill（44.4K token） | 1265 tok/s |
 | TTFT（短 prompt） | 0.26 s |
 | 上下文窗口 | 500K（模型上限 1M） |
+
+> ⚠️ **51 tok/s 那条路（hybrid-1.6 + DSpark）目前只在 benchmark 里稳**：真实长对话会触发 CUDA 非法内存访问把引擎搞死（详见坑 6）。日常服务请用稳定配置 `TAG=production-ready SPEC=off`（24.5 tok/s）——本脚本已把它设为默认。
 
 方案源头是 [tonyd2wild/deepseek-v4-flash-dgx-spark](https://github.com/tonyd2wild/deepseek-v4-flash-dgx-spark)（vLLM 双机 recipe，针对 preview 权重 + MTP 投机）。本文在它基础上适配了 0731 正式版和 DSpark 投机——这个组合截至写作时没有公开先例。**你不需要 clone 它的仓库**，本仓库的 `spark-launch-0731.sh` 是自包含的；想读原始文档再去看它。
 
@@ -138,6 +140,9 @@ hybrid-1.6 自带脚本设 `CUTE_DSL_ARCH=sm_120a`，但**带 a 后缀的 arch-s
 
 **坑 4：`io_issue_gather_dsv4_nope() got an unexpected keyword argument 'scale_format'`**
 镜像的黄金路径是 sm_120a 预编译 AOT 产物，换 arch 走现场编译后，B12X 激进路径的调用方和编译产物接口错位。对策：不开 `VLLM_USE_AOT_COMPILE`、`B12X_MLA_SM120_UNIFIED`、`--attention-backend B12X_MLA_SPARSE`，走默认路径（速度不受影响）。
+
+**坑 6（未解决，重要）：hybrid-1.6 双机在真实长对话下会崩**
+benchmark（短上下文、单发请求）一切正常、51 tok/s；但贴入几千 token 的长文多轮对话后，rank1 报 `CUDA error: an illegal memory access was encountered`（NCCL watchdog 掐掉进程，整个引擎死）。根因方向：sm_121a 是现场 JIT 编译的（官方预编译缓存全是 sm_120a），B12X 稀疏索引 kernel 按序列形状逐个编译变体，某些形状的生成代码在 GB10 上算飞。这在 cutlass DSL 代码生成层，用户侧改配置修不了。**结论：hybrid-1.6 + DSpark 目前只能当 benchmark 玩具；日常服务用 `TAG=production-ready SPEC=off`（24.5 tok/s，长对话稳定）。** 等镜像作者出 sm_121 适配版再回来收 51 那份快。
 
 **坑 5：hybrid-1.6 自带的 `serve-ds4-flash.sh` 是单机版**
 它硬编码 `NCCL_IB_DISABLE=1`、`TP_SIZE=4`、PCIe allreduce。双机必须绕开它自己拼 vllm 命令：NCCL 走 RoCE（HCA/GID/IFNAME 三件套）+ `--nnodes 2 --node-rank <N> --master-addr <head IP>`。本脚本干的就是这件事。
