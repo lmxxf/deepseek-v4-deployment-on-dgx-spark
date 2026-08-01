@@ -1,104 +1,170 @@
-# 如何使用 tonyd2wild 的 ds4 推理框架（双 DGX Spark 跑 DeepSeek-V4-Flash-0731）
+# 双 DGX Spark 跑 DeepSeek-V4-Flash-0731 完整教程（vLLM TP=2 + DSpark 投机解码）
 
-**2026-08-01 实录。最终战果：双机 TP=2 + DSpark 投机解码 = 51.1 tok/s（512 token、温度 0、单流）。**
+两台 NVIDIA DGX Spark（GB10，128GB 统一内存）直连组双机，跑 DeepSeek-V4-Flash-0731 正式版**原生精度权重**（FP8 + FP4 混合，不额外量化）。2026-08-01 实测：
 
-速度对照：
-
-| 方案 | 速度 |
+| 指标 | 实测值 |
 |---|---:|
-| 自家混合后端（preview 权重，185 期方案） | 12 tok/s |
-| production-ready 镜像、无投机（0731） | 24.5 tok/s |
-| **hybrid-1.6 镜像 + DSpark（0731）** | **51.1 tok/s** |
+| decode（DSpark 投机开启） | **51 tok/s** |
+| decode（纯自回归，无投机） | 24.5 tok/s |
+| prefill（8.9K token，热） | 1630 tok/s |
+| prefill（44.4K token） | 1265 tok/s |
+| TTFT（短 prompt） | 0.26 s |
+| 上下文窗口 | 500K（模型上限 1M） |
+
+方案源头是 [tonyd2wild/deepseek-v4-flash-dgx-spark](https://github.com/tonyd2wild/deepseek-v4-flash-dgx-spark)（vLLM 双机 recipe，针对 preview 权重 + MTP 投机）。本文在它基础上适配了 0731 正式版和 DSpark 投机——这个组合截至写作时没有公开先例。**你不需要 clone 它的仓库**，本仓库的 `spark-launch-0731.sh` 是自包含的；想读原始文档再去看它。
 
 ---
 
-## 一、这套东西是什么
+## 第 0 步：你需要什么
 
-- **recipe 仓库**：https://github.com/tonyd2wild/deepseek-v4-flash-dgx-spark （本地 clone 在 `~/work/deepseek-v4-flash-dgx-spark/`）
-  文档为主：README + TROUBLESHOOTING + `launch/unholy-launch.sh` 模板。方案 = vLLM 多机 TP=2，原生精度（FP8 dense + mxfp4 专家，**不额外量化**），NCCL 走 RoCE/RDMA。
-- **Docker 镜像**：`aidendle94/sparkrun-vllm-ds4-gb10`（arm64，为 GB10/sm_121 编译的 vLLM）
-  - `production-ready`（06-01，12.3GB）：recipe 原配。跑 0731 **必须关投机**（见坑 1）
-  - `production-hybrid-1.6`（07-26，11.4GB）：多模型大杂烩（GLM/Kimi/MiniMax 都有），**带 DSpark speculator**，但自带启动脚本是单机版——双机配置要自己写（本文核心增量）
-- **我们的启动脚本**：`~/work/deepseek-v4-flash-dgx-spark/launch/spark-launch.sh`（host）＋ slave 上 `~/work/dgx-spark-slave/spark-launch.sh`（同一文件的拷贝，改完记得 scp 同步）
+- 两台 DGX Spark，用 QSFP 线把两台的 ConnectX-7 200G 口直连（NVIDIA 官方叫 Spark Stacking），并配好 link-local IP（两台能互 ping）
+- 两台各 ~180GB 空闲磁盘（权重 167GB）
+- 两台的驱动 / 内核 / 固件版本**完全一致**（不一致会导致 prefill 性能减半甚至更怪的问题）
+- 两台之间 SSH 免密（方便操作，非硬性）
 
-## 二、前置条件
+下文把跑 API 服务的那台叫 **head（主机）**，另一台叫 **worker（从机）**。
 
-- 权重：`~/work/models/DeepSeek-V4-Flash-0731/`（167GB，48 shards），**两台都要全量**
-  - `hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ...`（支持断点续传）
-  - 同步 slave：`rsync -a --info=progress2 ~/work/models/DeepSeek-V4-Flash-0731 169.254.30.81:~/work/models/`（CX7 实测 439MB/s，约 6 分钟）
-- 镜像：两台各 `docker pull aidendle94/sparkrun-vllm-ds4-gb10:production-hybrid-1.6`（回退用的 `production-ready` 也建议留着）
-- 网络硬参数（我们这对机器，`show_gids` 现查可验证）：
-  - host spark-3a10 = 169.254.248.35，slave = 169.254.30.81
-  - HCA：**`rocep1s0f1`**（recipe 模板写的是 f0，我们接线的是 f1，照抄必翻车）
-  - `NCCL_IB_GID_INDEX=3`（RoCE v2 / IPv4 那条 GID）
-  - 控制面网口：`enp1s0f1np1`（我们没有独立有线以太网，控制面和 RDMA 共用 CX7 直连口）
-- RDMA 容器权限三件套（缺一 QP 握手就死）：`--privileged --ulimit memlock=-1 --device /dev/infiniband`
-- 两台驱动/内核/固件版本必须一致（recipe 实测不一致 prefill 掉一半）
+## 第 1 步：下载权重（两台都要全量）
 
-## 三、启动与验证
+在 head 上：
 
 ```bash
-# 先 worker（slave）
-ssh 169.254.30.81 "bash ~/work/dgx-spark-slave/spark-launch.sh 1"
-# 后 head（host）
-~/work/deepseek-v4-flash-dgx-spark/launch/spark-launch.sh 0
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 --local-dir ~/work/models/DeepSeek-V4-Flash-0731
+```
 
-# 盯日志（权重加载 + CUDA graph 捕获约 6-8 分钟）
-docker logs -f vllm_unholy        # 等 "Application startup complete"
-# 关键健康标记：
-#   "enabling UE8M0 for DeepGEMM"          → FP8 快速路径生效（没有它会掉到 5 tok/s 档）
-#   "DSpark draft model loaded: 96 params" → 草稿头挂载成功
-#   "Capturing dspark CUDA graphs"         → 投机路径 cudagraph 就绪
+167GB，支持断点续传（断了重跑同一条命令）。下完同步给 worker（走直连口，200G 线实测 439MB/s，约 6 分钟）：
 
-# 验活
+```bash
+rsync -a --info=progress2 ~/work/models/DeepSeek-V4-Flash-0731 <worker的IP>:~/work/models/
+```
+
+权重放别处也行，后面用 `MODEL_DIR` 环境变量指过去即可。
+
+## 第 2 步：拉镜像（两台都要）
+
+```bash
+docker pull aidendle94/sparkrun-vllm-ds4-gb10:production-hybrid-1.6
+```
+
+这是社区为 GB10（sm_121）编译好的 vLLM 镜像（arm64，约 11GB）。`production-hybrid-1.6` 是目前唯一支持 0731 DSpark 草稿头的 tag。建议顺手把回退用的旧稳定版也拉了：
+
+```bash
+docker pull aidendle94/sparkrun-vllm-ds4-gb10:production-ready
+```
+
+## 第 3 步：拿启动脚本（两台各放一份）
+
+就是本仓库的 [`spark-launch-0731.sh`](./spark-launch-0731.sh)。clone 本仓库或者直接下载单个文件都行：
+
+```bash
+git clone https://github.com/lmxxf/deepseek-v4-deployment-on-dgx-spark.git
+cd deepseek-v4-deployment-on-dgx-spark
+chmod +x spark-launch-0731.sh
+# 复制一份给 worker：
+scp spark-launch-0731.sh <worker的IP>:~/
+```
+
+## 第 4 步：查你自己的网络参数，改脚本头部五个变量
+
+脚本头部有五个变量，**默认值是我这对机器的，你的大概率不同**，逐个查：
+
+```bash
+ibstatus            # 看哪个 RoCE 设备是 ACTIVE —— 那就是接了线的 HCA（如 rocep1s0f1）
+show_gids           # 找该 HCA 下类型为 "RoCE v2"、地址是 IPv4 的那行，记下它的 GID index（通常是 3）
+ip -br addr         # 找 HCA 对应的网口名（如 enp1s0f1np1）和 head 机在这个口上的 IP
+```
+
+注意：DGX Spark 有两个 RoCE 口，**只有接线的那个能用**——没接线的口 GID 3 是空的，配错了 NCCL 的 QP 握手会直接死掉。这是最常见的翻车点。
+
+把查到的值填进脚本头部（两台的脚本都要改，或者跑的时候用环境变量传）：
+
+```bash
+MASTER_ADDR=...   # head 机在直连口上的 IP
+NCCL_HCA=...      # 接线的 RoCE 设备名
+NET_IF=...        # 对应网口名
+GID_INDEX=...     # RoCE v2 的 GID index
+MODEL_DIR=...     # 权重目录（默认 ~/work/models/DeepSeek-V4-Flash-0731）
+```
+
+## 第 5 步：启动（顺序很重要：先 worker，后 head）
+
+```bash
+# worker 机上：
+./spark-launch-0731.sh 1
+
+# head 机上：
+./spark-launch-0731.sh 0
+```
+
+容器是后台运行的（`docker run -d`），终端立刻返回。在 head 上盯日志：
+
+```bash
+docker logs -f vllm_unholy
+```
+
+权重加载 + CUDA graph 捕获约 6 到 8 分钟。依次应该看到这些健康标记：
+
+```
+enabling UE8M0 for DeepGEMM            ← FP8 快速路径生效（没有它速度会掉到 5 tok/s 档）
+Loading safetensors checkpoint shards  ← 权重加载（48 片）
+DSpark draft model loaded: 96 params   ← 投机草稿头挂载成功
+Capturing dspark CUDA graphs           ← 投机路径就绪
+Application startup complete.          ← 完成
+```
+
+## 第 6 步：验证
+
+```bash
 curl -s http://localhost:8000/v1/models
+
 curl -s http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好"}],"max_tokens":50}'
 ```
 
-脚本开关（环境变量前缀）：
+标准 OpenAI 兼容 API，Open WebUI / 各类客户端直接指向 `http://<head的IP>:8000` 即可。冷启动后第一个请求可能因 JIT 预热而超时，重试就好。
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `TAG` | production-hybrid-1.6 | 镜像 tag；`production-ready` 走旧入口 `dsv4-vllm-entrypoint` |
-| `SPEC` | dspark | `dspark` / `mtp` / `off`；**production-ready 必须 off** |
+## 第 7 步（排障）：我们踩过的五个坑
 
-回退到验证过的稳定组合（24.5 tok/s）：
-```bash
-ssh 169.254.30.81 "TAG=production-ready SPEC=off bash ~/work/dgx-spark-slave/spark-launch.sh 1"
-TAG=production-ready SPEC=off ~/work/deepseek-v4-flash-dgx-spark/launch/spark-launch.sh 0
-```
+照上面流程走理论上不会再遇到（脚本里都规避了），但如果你改配置或换镜像版本，这些是雷区：
 
-停服务：两台各 `docker rm -f vllm_unholy`。
+**坑 1：`KeyError: 'model.layers.43.mtp_block.main_norm.weight'`**
+用 `production-ready` 旧镜像 + 0731 权重 + 开投机时必炸：0731 把 preview 的串行 MTP 预测层改造成了 DSpark 结构（config 里 compress_ratios 从 44 项变 46 项，多出的两层就是草稿模块），旧镜像只认旧参数名。对策：旧镜像必须 `SPEC=off`；要投机用 hybrid-1.6（`--speculative-config '{"method":"dspark",...}'`，草稿权重就在主 checkpoint 里）。
 
-对话前端：`docker start open-webui` → http://192.168.31.198:3000（对接 8000 端口的 OpenAI 兼容 API）。
-
-## 四、踩坑实录（按时间顺序，每个都附机制）
-
-**坑 1：production-ready + 0731 权重，草稿模型加载 KeyError**
-`KeyError: 'model.layers.43.mtp_block.main_norm.weight'`——主模型 48 片全加载完，炸在 drafter。机制：0731 把 preview 的串行 MTP 预测层改造成了 DSpark 结构（config 佐证：compress_ratios 从 44 项加长到 46 项，多出的两层就是草稿模块的），06-01 的镜像只认旧 MTP 参数名。**对策**：旧镜像 `SPEC=off` 可正常跑主干；要投机就换 hybrid-1.6——它有独立的 dspark speculator（`--speculative-config '{"method":"dspark",...}'`，草稿权重就藏在主 checkpoint 里，不用单独文件）。
-
-**坑 2：hybrid-1.6 秒退，`dsv4-vllm-entrypoint: No such file or directory`**
-新镜像目录布局全变：老入口没了，vllm 在 `/opt/venv/bin/`，自带一堆 `serve-*.sh`。机制：hybrid 系列是多模型镜像，和 production-ready 不同源。**对策**：直接 `python -m vllm.entrypoints.cli.main serve` 自己拼参数。
+**坑 2：容器秒退，`dsv4-vllm-entrypoint: No such file or directory`**
+hybrid-1.6 和 production-ready 目录布局完全不同：老入口没了，vllm 在 `/opt/venv/bin/`。脚本已按 tag 分流。
 
 **坑 3：`Target SM ARCH sm_120a is not compatible`（cudaErrorNoKernelImageForDevice）**
-照抄了它 serve 脚本里的 `CUTE_DSL_ARCH=sm_120a`。机制：**带 a 后缀的 arch-specific 二进制不向前兼容**——sm_120 普通 kernel 能在 sm_121 上跑，sm_120a 的不行（和 182 期勘误的 sm_120/121 刀法同一族）。**对策**：改 `CUTE_DSL_ARCH=sm_121a`。
+hybrid-1.6 自带脚本设 `CUTE_DSL_ARCH=sm_120a`，但**带 a 后缀的 arch-specific 二进制不向前兼容**——sm_120 普通 kernel 能在 sm_121（GB10）上跑，sm_120a 的不行。必须 `sm_121a`。
 
 **坑 4：`io_issue_gather_dsv4_nope() got an unexpected keyword argument 'scale_format'`**
-机制：镜像的黄金路径是"sm_120a 预编译 AOT 产物 + 单机启动流程"，换 arch 后走现场编译，B12X 激进路径的 Python 调用方和编译产物接口错位。**对策**：砍掉三个激进项走默认路径——`VLLM_USE_AOT_COMPILE=1`、`B12X_MLA_SM120_UNIFIED=1`、`--attention-backend B12X_MLA_SPARSE`。砍完即通，速度照样 51 tok/s。
+镜像的黄金路径是 sm_120a 预编译 AOT 产物，换 arch 走现场编译后，B12X 激进路径的调用方和编译产物接口错位。对策：不开 `VLLM_USE_AOT_COMPILE`、`B12X_MLA_SM120_UNIFIED`、`--attention-backend B12X_MLA_SPARSE`，走默认路径（速度不受影响）。
 
-**坑 5（设计差异，不是 bug）：hybrid-1.6 自带脚本是单机版**
-`serve-ds4-flash.sh` 硬编码 `NCCL_IB_DISABLE=1`、`TP_SIZE=4`、PCIe allreduce——面向单机多卡/新形态。双机要绕开它的脚本自己起 vllm，把 NCCL 环境换成我们的 RoCE 三件套（HCA/GID/IFNAME）+ `--nnodes 2 --node-rank N --master-addr 169.254.248.35`。**双机跑 hybrid-1.6 网上没有先例，此文档即首个记录。**
+**坑 5：hybrid-1.6 自带的 `serve-ds4-flash.sh` 是单机版**
+它硬编码 `NCCL_IB_DISABLE=1`、`TP_SIZE=4`、PCIe allreduce。双机必须绕开它自己拼 vllm 命令：NCCL 走 RoCE（HCA/GID/IFNAME 三件套）+ `--nnodes 2 --node-rank <N> --master-addr <head IP>`。本脚本干的就是这件事。
 
-## 五、遗留与备忘
+另外两个通用提醒：
+- RDMA 容器权限三件套缺一不可：`--privileged --ulimit memlock=-1 --device /dev/infiniband`（脚本已带）
+- 强杀 CUDA 进程可能把 CX7 网卡搞进脏状态，之后 NCCL 莫名不通就先怀疑它，严重时两台重启
 
-- 口径备注：51.1 是端到端（512 tok ÷ 总时间）；流式复测排除 prefill 后纯 decode = **50.4 tok/s**（TTFT 0.256s，短 prompt 下两口径几乎重合）。注意这是 DSpark 投机加持的吞吐，纯自回归裸速是 24.5
-- prefill 实测（max_tokens=1，随机盐防 prefix cache）：8.9K token 冷 820 / 热 **1630 tok/s**；44.4K token **1265 tok/s**（35 秒读完，长度增大略降是 attention 随长度涨的正常物理）。首个同形状请求含 JIT 编译，速度打半折
-- `--max-model-len 500000` 稳定；模型上限 1M，没实测（KV cache FP8 下 1M 才约 5GB，内存不是约束，prefill 时间才是）
-- 并发吞吐没量（recipe 报 8 并发 92 tok/s，是 MTP 时代的数，DSpark 下应该更高）
-- 首请求可能超时（JIT 预热），重试即秒回
-- 强杀 CUDA 进程可能搞脏 CX7，症状不对先想想这个（老教训，严重时两台重启）
-- 老混合后端（185 期发布的自家 Docker Hub 镜像）和 preview 权重（`~/work/deepseek-v4-flash-deployment/deepseek-v4-flash/`）保留当考古备份
+## 第 8 步：回退与停止
+
+hybrid-1.6 出问题时，回退到验证过的稳定组合（无投机，24.5 tok/s）：
+
+```bash
+# 两台都加同样的前缀，仍然先 worker 后 head
+TAG=production-ready SPEC=off ./spark-launch-0731.sh 1   # worker
+TAG=production-ready SPEC=off ./spark-launch-0731.sh 0   # head
+```
+
+停止服务：两台各执行 `docker rm -f vllm_unholy`。
 
 ---
-*整理：2026-08-01，随 0731 正式版部署实录。相关公众号：185 期（自家混合后端史）、236 期（DSpark 原理）、273 期（0731 评测与家用部署生态）。*
+
+## 附：性能口径说明
+
+- 51 tok/s 是 DSpark 投机解码加持的生成吞吐（512 token、温度 0、单流；流式复测排除 prefill 后纯 decode 50.4 tok/s，TTFT 0.26s）。纯自回归裸速 24.5 tok/s——投机的原理是草稿头一次猜一块、主模型一次前向并行验证，输出分布与纯自回归完全一致，无质量损失
+- prefill 实测（max_tokens=1、随机盐防 prefix cache 命中）：8.9K token 冷 820 / 热 1630 tok/s，44.4K token 1265 tok/s。首个同形状请求含 JIT 编译，速度打半折
+- 并发吞吐未测（原 recipe 报 8 并发 92 tok/s，是 preview + MTP 时代的数字）
+- `--max-model-len 500000` 稳定；模型上限 1M 未实测（CSA/HCA 压缩下 FP8 KV 的 1M 上下文仅约 5GB，内存不是瓶颈，prefill 时间才是）
+
+*2026-08-01，随 0731 正式版发布当周的部署实录。*
