@@ -1,5 +1,10 @@
 # DeepSeek V4 Flash on Dual DGX Spark
 
+> ## ⚠️ DEPRECATED (2026-08-01)
+> This mixed-backend approach (12 tok/s, for the **preview** weights) is obsolete. For the official **V4-Flash-0731** release we now use upstream community images — **51 tok/s** with DSpark speculative decoding, no custom patches needed.
+> **👉 Follow the new guide: [如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md)**
+> Everything below is kept for archaeology only.
+
 [中文文档](README_CN.md) | English
 
 Run **DeepSeek V4 Flash (280B, FP4)** on two **NVIDIA DGX Spark** nodes (128GB x2) connected via ConnectX-7 200Gbps RDMA.

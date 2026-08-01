@@ -1,5 +1,10 @@
 # DeepSeek V4 Flash 双机部署指南
 
+> ## ⚠️ 本文档已废弃（2026-08-01）
+> 这套混合后端方案（12 tok/s，针对 **preview** 权重）已过时。**V4-Flash-0731 正式版**改用上游社区镜像——DSpark 投机解码 **51 tok/s**，不再需要自制补丁。
+> **👉 直接看新教程：[如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md)**
+> 以下内容仅作考古存档。
+
 [English](README.md) | 中文
 
 两台 DGX Spark (128GB×2) 通过 ConnectX-7 200Gbps 运行 DeepSeek V4 Flash (280B, 158GB FP4)。
