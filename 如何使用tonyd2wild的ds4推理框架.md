@@ -93,6 +93,7 @@ TAG=production-ready SPEC=off ~/work/deepseek-v4-flash-dgx-spark/launch/spark-la
 ## 五、遗留与备忘
 
 - 口径备注：51.1 是端到端（512 tok ÷ 总时间）；流式复测排除 prefill 后纯 decode = **50.4 tok/s**（TTFT 0.256s，短 prompt 下两口径几乎重合）。注意这是 DSpark 投机加持的吞吐，纯自回归裸速是 24.5
+- prefill 实测（max_tokens=1，随机盐防 prefix cache）：8.9K token 冷 820 / 热 **1630 tok/s**；44.4K token **1265 tok/s**（35 秒读完，长度增大略降是 attention 随长度涨的正常物理）。首个同形状请求含 JIT 编译，速度打半折
 - `--max-model-len 500000` 稳定；模型上限 1M，没实测（KV cache FP8 下 1M 才约 5GB，内存不是约束，prefill 时间才是）
 - 并发吞吐没量（recipe 报 8 并发 92 tok/s，是 MTP 时代的数，DSpark 下应该更高）
 - 首请求可能超时（JIT 预热），重试即秒回
