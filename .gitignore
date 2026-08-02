@@ -13,3 +13,5 @@ test/vllm-40082/
 debug_acts
 debug_acts_all_marlin
 debug_acts_mixed
+image-vllm-production-ready
+local-docsDeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark/
