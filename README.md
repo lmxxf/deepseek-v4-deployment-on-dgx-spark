@@ -1,8 +1,13 @@
 # DeepSeek V4 Flash on Dual DGX Spark
 
 > ## ⚠️ DEPRECATED (2026-08-01)
-> This mixed-backend approach (12 tok/s, for the **preview** weights) is obsolete. For the official **V4-Flash-0731** release we now use upstream community images — **51 tok/s** with DSpark speculative decoding, no custom patches needed.
-> **👉 Follow the new guide: [如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md)**
+> This mixed-backend approach (12 tok/s, for the **preview** weights) is obsolete. For the official **V4-Flash-0731** release we now use upstream community stacks — pick one:
+>
+> | New stack | Precision | Speed | Guide |
+> |---|---|---|---|
+> | Stable (no speculation) | Native FP8+FP4 weights, FP8 KV cache | 24.5 tok/s | [如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md) |
+> | Fast (DSpark speculation + 4-bit KV) | Same weights, KV cache in experimental NVFP4 (4-bit) | 83.8 tok/s peak / 52.6 code | [使用tonyd2wild最新的4bit激活量化推理.md](./使用tonyd2wild最新的4bit激活量化推理.md) |
+>
 > Everything below is kept for archaeology only.
 
 [中文文档](README_CN.md) | English

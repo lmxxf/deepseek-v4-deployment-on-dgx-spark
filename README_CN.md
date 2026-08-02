@@ -1,8 +1,13 @@
 # DeepSeek V4 Flash 双机部署指南
 
 > ## ⚠️ 本文档已废弃（2026-08-01）
-> 这套混合后端方案（12 tok/s，针对 **preview** 权重）已过时。**V4-Flash-0731 正式版**改用上游社区镜像——DSpark 投机解码 **51 tok/s**，不再需要自制补丁。
-> **👉 直接看新教程：[如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md)**
+> 这套混合后端方案（12 tok/s，针对 **preview** 权重）已过时。**V4-Flash-0731 正式版**改用上游社区方案，按需二选一：
+>
+> | 新方案 | 精度 | 速度 | 教程 |
+> |---|---|---|---|
+> | 稳定档（无投机） | 权重原生 FP8+FP4，KV cache FP8 | 24.5 tok/s | [如何使用tonyd2wild的ds4推理框架.md](./如何使用tonyd2wild的ds4推理框架.md) |
+> | 快档（DSpark 投机 + 4bit KV） | 权重同上，KV cache 压到 NVFP4（4 比特，实验性） | 峰值 83.8 / 代码 52.6 tok/s | [使用tonyd2wild最新的4bit激活量化推理.md](./使用tonyd2wild最新的4bit激活量化推理.md) |
+>
 > 以下内容仅作考古存档。
 
 [English](README.md) | 中文
