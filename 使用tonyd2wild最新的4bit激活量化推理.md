@@ -18,8 +18,8 @@
 ## 一、仓库与前置
 
 ```bash
-cd ~/work/deepseek-v4-flash-deployment
 git clone https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark.git
+cd DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark
 ```
 
 前置与旧方案相同：两台的权重全量（`~/work/models/DeepSeek-V4-Flash-0731/`）、SSH 免密、RoCE 直连。镜像**本地构建**（基础镜像 `ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready` 会在 build 时自动拉取，需翻墙覆盖 Docker）。
@@ -29,7 +29,6 @@ git clone https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-K
 从模板复制并改我们的值（仓库根目录）：
 
 ```bash
-cd DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark
 cp .env.dspark.example .env.dspark
 ```
 
@@ -60,7 +59,8 @@ WORKER_VLLM_HOST_IP=169.254.30.81
 把仓库同步给 worker（同路径镜像；之后 start 脚本每次会自动同步 compose 和 .env，但首次全量要手动）：
 
 ```bash
-rsync -a ~/work/deepseek-v4-flash-deployment/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark 169.254.30.81:~/work/deepseek-v4-flash-deployment/
+# 把整个 checkout 同步到 worker 的相同路径（示例按本机路径，改成你自己的）
+rsync -a "$(pwd)" 169.254.30.81:"$(dirname "$(pwd)")/"
 ```
 
 ## 三、坑：基础镜像烤死了作者的网口名（必改）
