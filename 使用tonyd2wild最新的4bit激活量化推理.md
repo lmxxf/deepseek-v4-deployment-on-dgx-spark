@@ -22,7 +22,7 @@ git clone https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-K
 cd DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark
 ```
 
-前置与旧方案相同：两台的权重全量（`~/work/models/DeepSeek-V4-Flash-0731/`）、SSH 免密、RoCE 直连。镜像**本地构建**（基础镜像 `ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready` 会在 build 时自动拉取，需翻墙覆盖 Docker）。
+前置与旧方案相同：两台的权重全量（`~/work/models/DeepSeek-V4-Flash-0731/`）、SSH 免密、RoCE 直连。镜像**本地构建**（基础镜像 `ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready` 会在 build 时自动拉取，需翻墙覆盖 Docker）。注意基础镜像在 **ghcr.io（GitHub 容器仓库）**，不在 Docker Hub——去 hub.docker.com 搜不到是正常的，手动拉取必须带 `ghcr.io/` 前缀。
 
 ## 二、配置 .env.dspark
 
